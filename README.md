@@ -23,7 +23,7 @@ Community edition: works on **public GitHub repositories** only.
 ## Install
 
 ```bash
-curl -fsSL https://festomanolo.com/GitNolo/install.sh | sh
+curl -fsSL https://festomanolo.com/gitnolo/install.sh | sh
 gitnolo doctor
 ```
 
@@ -118,4 +118,4 @@ one, for example `auto_merge false` or `settle_seconds 5`.
 - `gitnolo watch --plain` prints a line log instead of the dashboard, for running it
   as a background service.
 
-MIT License · Made by [Festo K. Magembe](https://festomanolo.com) · [festomanolo.com/GitNolo](https://festomanolo.com/GitNolo)
+MIT License · Made by [Festo K. Magembe](https://festomanolo.com) · [festomanolo.com/gitnolo](https://festomanolo.com/gitnolo)

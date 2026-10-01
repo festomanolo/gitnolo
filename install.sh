@@ -1,6 +1,6 @@
 #!/bin/sh
 # gitnolo community installer
-#   curl -fsSL https://festomanolo.com/GitNolo/install.sh | sh
+#   curl -fsSL https://festomanolo.com/gitnolo/install.sh | sh
 # Uninstall:
 #   rm -rf ~/.gitnolo/app ~/.local/bin/gitnolo
 set -eu

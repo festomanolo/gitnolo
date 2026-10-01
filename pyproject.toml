@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://festomanolo.com/GitNolo"
+Homepage = "https://festomanolo.com/gitnolo"
 Source = "https://github.com/festomanolo/gitnolo"
 
 [project.optional-dependencies]
