@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gitnolo"
+version = "0.4.0"
+description = "Autonomous git for coding agents on public GitHub repositories"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Festo K. Magembe" }]
+dependencies = [
+    "rich>=13.0.0",
+    "psutil>=5.9.0",
+]
+
+[project.urls]
+Homepage = "https://festomanolo.com/GitNolo"
+Source = "https://github.com/festomanolo/gitnolo"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["gitnolo"]
+
+[project.scripts]
+gitnolo = "gitnolo.cli:main"
