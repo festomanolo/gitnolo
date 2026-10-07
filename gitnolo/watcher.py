@@ -12,6 +12,14 @@ quiet period (`fallback_idle_seconds`).
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "queue", "threading", "rich.console", "rich.live", "rich.text", "gitnolo", "gitnolo.agents",
+    "gitnolo.config", "gitnolo.gitcore", "gitnolo.pipeline", "gitnolo.state", "gitnolo.live_issues", "gitnolo.scene",
+    "gitnolo.checkpoints",
+]
+
+import os
 import queue
 import sys
 import threading
@@ -24,8 +32,9 @@ from rich.console import Group
 from rich.live import Live
 from rich.text import Text
 
-from . import __version__, ui
+from . import __version__, checkpoints, scene, ui
 from .agents import FINISHED, RUNNING, AgentEvent, Session, Tracker
+from .live_issues import LiveIssues
 from .config import AppConfig
 from .gitcore import GitError, Repo
 from .pipeline import Pipeline, RunOptions, RunResult
@@ -52,10 +61,14 @@ class Watcher:
         self.plain = plain or not sys.stdout.isatty()
         self.tracker = Tracker(config.monitored_agents, config.transcript_horizon_hours)
         self.pending: Dict[str, Pending] = {}
-        self.log: Deque[Tuple[float, str, str]] = deque(maxlen=14)
+        self.log: Deque[Tuple[float, str, str]] = deque(maxlen=12)
         self.jobs: "queue.Queue[Pending]" = queue.Queue()
         self.active_job: Optional[str] = None
         self.active_step: str = ""
+        self.active_stage: str = ""
+        self.live = LiveIssues(config, self.state, self.note, catch_up=self.catch_up) if config.live_issues else None
+        self.lanes = scene.Lanes()
+        self.last_checkpoint: Dict[str, float] = {}
         self.repo_changes: Dict[str, Tuple[float, int]] = {}
         self.proc_sigs: Dict[str, Tuple[str, float]] = {}
         self._lock = threading.Lock()
@@ -85,6 +98,10 @@ class Watcher:
         if not self.plain:
             threading.Thread(target=self._refresh_changes, daemon=True).start()
         threading.Thread(target=self._probe_network, daemon=True).start()
+        if self.live:
+            self.live.observe(sessions)  # baseline: history from before the watcher started
+            if not self.dry_run:  # a dry run snaps issues but never publishes or closes them
+                threading.Thread(target=self._sync_issues, daemon=True).start()
         try:
             if self.plain:
                 while not self._stop.is_set():
@@ -107,6 +124,8 @@ class Watcher:
         sessions, events = self.tracker.poll()
         for ev in events:
             self._on_event(ev)
+        if self.live:
+            self.live.observe(sessions)
         self._fallback_triggers(sessions)
         self._check_pending(live)
 
@@ -151,6 +170,42 @@ class Watcher:
                 self.pending[s.repo] = Pending(s.repo, f"{s.agent} exited", s)
         elif ev.kind == "started":
             self.note("start", f"{s.agent} started in {where}")
+            self._checkpoint(s)
+        elif ev.kind == "turn_started":
+            self._checkpoint(s)
+        elif ev.kind == "looping":
+            self.note("loop", f"{s.agent} in {where} looks stuck: {s.detail.split(':', 1)[-1]}")
+            if self.config.notify:
+                ui.notify("gitnolo", f"{s.agent} in {where} looks stuck in a loop")
+
+    def _checkpoint(self, s: Session) -> None:
+        """Snapshots the repo as the agent starts working, in the background (gitnolo rewind)."""
+        if not (self.config.checkpoints and s.repo) or self.dry_run:
+            return
+        now = time.time()
+        if now - self.last_checkpoint.get(s.repo, 0) < 60:
+            return
+        self.last_checkpoint[s.repo] = now
+        repo_path, label = s.repo, f"{s.agent} started: {(s.title or 'new turn')[:60]}"
+
+        def work() -> None:
+            try:
+                cp = checkpoints.create(Repo(repo_path), label, self.config.checkpoint_keep)
+            except GitError as e:
+                self.note("warn", f"checkpoint failed: {e}")
+                return
+            if cp:
+                self.note("ckpt", f"{s.repo_name}: checkpoint {cp.short} (gitnolo rewind)")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _sync_issues(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.live.sync()  # type: ignore[union-attr]
+            except Exception as e:  # never let the thread die
+                self.note("warn", f"issue sync: {e}")
+            self._stop.wait(3.0)
 
     def _fallback_triggers(self, sessions: List[Session]) -> None:
         """Process-only agents (no transcript): commit after a long quiet period."""
@@ -228,6 +283,7 @@ class Watcher:
             finally:
                 self.active_job = None
                 self.active_step = ""
+                self.active_stage = ""
 
     def _execute(self, p: Pending, interactive: bool) -> RunResult:
         self.active_job = p.repo
@@ -236,6 +292,9 @@ class Watcher:
         self.note("run", f"{name}: {p.reason}, starting pipeline")
 
         def emit(kind: str, text: str) -> None:
+            if kind == "stage":
+                self.active_stage = text
+                return
             self.active_step = text
             if kind in ("ok", "warn", "error", "step"):
                 self.note({"step": "step", "ok": "ok", "warn": "warn", "error": "error"}[kind], f"{name}: {text}")
@@ -247,6 +306,10 @@ class Watcher:
             from .cli import confirm_plan
 
             confirm = confirm_plan
+        related: List[Tuple[int, str, str]] = []
+        if self.live and not self.dry_run:
+            self.live.sync(p.repo)  # the final report's issues are due at once; file them before the PR
+            related = self.live.related(p.repo, s.key if s else None)
         pipe = Pipeline(self.config, self.state, emit)
         res = pipe.run(
             p.repo,
@@ -257,10 +320,14 @@ class Watcher:
                 final_message=s.final_message if s else "",
                 partial=bool(s and s.partial),
                 stop_reason=s.stop_reason if s else "",
+                issues=False if self.live else None,
+                related_issues=related,
                 confirm=confirm,
             ),
         )
-        if s and s.turn_id and (res.ok or "nothing" in " ".join(res.notes)):
+        # A run that wrote commits but failed later (e.g. push) is not retried: a retry
+        # would rebuild every commit on a new branch and fail the same way.
+        if s and s.turn_id and (res.ok or res.commits or "nothing" in " ".join(res.notes)):
             self.state.mark_turn(s.turn_id)
             self.state.save()
         if res.ok and res.commits:
@@ -273,6 +340,7 @@ class Watcher:
             self.note("error", f"{name}: {res.error}")
         self.active_job = None
         self.active_step = ""
+        self.active_stage = ""
         return res
 
     # ------------------------------------------------------------ view
@@ -284,8 +352,17 @@ class Watcher:
             (ui.STAR + " ", "accent"), ("gitnolo", "accent.bold"), (f" v{__version__}", "muted"), ("  watch", "bold"),
             ("   ", ""), (f"{sum(1 for r in rows if r.state in ('working', 'running'))} working", "accent"),
             ("  ", ""), (f"{sum(1 for r in rows if r.state == 'waiting')} waiting", "warn"),
-            ("   today ", "muted"), (f"{today['commits']} commits  {today['prs']} PRs  {today['merged']} merged  {today['issues']} issues", ""),
+            ("   today ", "muted"), (f"{today['commits']} commits  {today['prs']} PRs  {today['merged']} merged", ""),
+            ("   issues ", "muted"), (f"{len(self.state.open_ledger())} open", "warn" if self.state.open_ledger() else "faint"),
         )
+        world: List[Any] = []
+        if self.config.show_map and self.config.animations_enabled:
+            world = self.lanes.render(rows, ui.console.width, now=time.time(), limit=4)
+            job = self.active_job
+            if job:
+                world += [Text(""), scene.pipeline_map(os.path.basename(job), self.active_stage)]
+            if world:
+                world = [Text("")] + world
         t = ui.table("", "agent", "repository", "task*", "activity", "idle", "changes")
         now = time.time()
         for s in rows[:12]:
@@ -321,7 +398,7 @@ class Watcher:
         foot = Text("  ctrl+c to stop" + ("  ·  auto: commits, pushes, opens and merges PRs" if self.auto else "  ·  confirm mode"),
                     style="faint")
         head.append_text(net)
-        return Group(Text(""), head, Text(""), t, Text(""), *log_lines, Text(""), foot)
+        return Group(Text(""), head, *world, Text(""), t, Text(""), *log_lines, Text(""), foot)
 
     def _changes(self, repo: Optional[str], now: float) -> int:
         cached = self.repo_changes.get(repo or "")
@@ -369,6 +446,7 @@ def _until(ts: Optional[float]) -> str:
 
 
 _KIND_GLYPH = {"done": "✓", "ok": ui.DOT, "run": ui.DOT, "step": ui.ELBOW, "warn": "!", "error": "×", "wait": "◆",
-               "stop": "■", "stall": "◌", "exit": "○", "start": "●", "info": "·"}
+               "stop": "■", "stall": "◌", "exit": "○", "start": "●", "info": "·", "issue": "⚑", "loop": "↻", "ckpt": "◈"}
 _KIND_STYLE = {"done": "ok", "ok": "ok", "run": "accent", "step": "muted", "warn": "warn", "error": "err", "wait": "warn",
-               "stop": "err", "stall": "muted", "exit": "faint", "start": "info", "info": "muted"}
+               "stop": "err", "stall": "muted", "exit": "faint", "start": "info", "info": "muted", "issue": "warn",
+               "loop": "warn", "ckpt": "info"}

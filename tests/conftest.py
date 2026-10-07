@@ -67,6 +67,7 @@ class FakeGitHub:
         self.private = private
         self.prs = {}
         self.issues = []
+        self.comments = []
         self.calls = []
         self.block_merge = False
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
@@ -137,6 +138,10 @@ class FakeGitHub:
                     n = int(body["variables"]["id"].split("_")[1])
                     fake.prs[n]["draft"] = False
                     return self._send(200, {"data": {}})
+                m = re.match(r"^/repos/o/r/issues/(\d+)/comments$", u.path)
+                if m:
+                    fake.comments.append((int(m.group(1)), body["body"]))
+                    return self._send(201, {"id": len(fake.comments)})
                 if u.path == "/repos/o/r/issues":
                     n = len(fake.prs) + len(fake.issues) + 1
                     it = {"number": n, "title": body["title"], "body": body["body"], "labels": body.get("labels", []), "state": "open",
@@ -159,6 +164,19 @@ class FakeGitHub:
                     sha = fake._merge(pr)
                     pr["state"] = "closed"
                     return self._send(200, {"merged": True, "sha": sha})
+                self._send(404, {"message": "Not Found"})
+
+            def do_PATCH(self):
+                u = urlparse(self.path)
+                body = self._body()
+                fake.calls.append(("PATCH", u.path))
+                m = re.match(r"^/repos/o/r/issues/(\d+)$", u.path)
+                if m:
+                    it = next((i for i in fake.issues if i["number"] == int(m.group(1))), None)
+                    if it is None:
+                        return self._send(404, {"message": "Not Found"})
+                    it.update({k: v for k, v in body.items() if k in ("state", "title", "body")})
+                    return self._send(200, it)
                 self._send(404, {"message": "Not Found"})
 
             def do_DELETE(self):

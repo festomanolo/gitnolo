@@ -4,6 +4,11 @@ Persistent configuration (~/.gitnolo/config.json).
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "json",
+]
+
 import json
 import os
 from dataclasses import asdict, dataclass, field, fields
@@ -60,9 +65,11 @@ class AppConfig:
     catch_up: bool = False               # on start, also process turns that finished before gitnolo ran
 
     # Commits
-    private_commit_target: int = 600
+    private_commit_min: int = 100        # private repos: a fresh random count in [min, target] per change
+    private_commit_target: int = 600     # upper bound for private repos
     public_commit_min: int = 15
     public_commit_max: int = 15
+    repo_commit_targets: Dict[str, int] = field(default_factory=dict)  # repo root -> commits, overrides policy
 
     # GitHub
     auto_push: bool = True
@@ -73,8 +80,27 @@ class AppConfig:
     auto_issues: bool = True
     max_issues_per_turn: int = 5
     github_token: Optional[str] = None
+    gitlab_token: Optional[str] = None
+
+    # Live issues: snapped from agent messages as they stream, closed when the agent resolves them
+    live_issues: bool = True
+    live_issue_grace_seconds: float = 30.0   # resolved within this window -> never published
+    auto_close_issues: bool = True
+
+    # Rapid response (gitnolo supervise / Claude Code hook)
+    rapid_response: bool = True
+    rapid_away_seconds: float = 45.0     # no keystrokes for this long = you are away
+    rapid_choice_delay: float = 15.0     # questions get option 1 after this long, only while away
+    rapid_hook_scope: str = "all"        # all | edits: what the Claude Code hook may approve
+
+    # Safety nets
+    checkpoints: bool = True             # snapshot the tree when an agent starts a turn (gitnolo rewind)
+    checkpoint_keep: int = 60
+    guard_tests: bool = True             # deleted/skipped tests or dropped assertions block auto-merge
+    guard_secrets: bool = True           # files containing API keys / private keys are never committed
 
     # Experience
+    show_map: bool = True                # animated lanes and pipeline map in `watch`
     interactive: bool = True
     notify: bool = True
     animations_enabled: bool = True
@@ -108,7 +134,7 @@ class AppConfig:
 
     def as_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        for secret in ("github_token", "openrouter_api_key"):
+        for secret in ("github_token", "gitlab_token", "openrouter_api_key"):
             if d.get(secret):
                 d[secret] = "********"
         return d

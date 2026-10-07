@@ -8,6 +8,11 @@ Token resolution order: explicit config -> GITHUB_TOKEN / GH_TOKEN ->
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "json", "re", "shutil", "subprocess", "urllib.error", "urllib.parse", "urllib.request",
+]
+
 import json
 import os
 import re
@@ -91,6 +96,8 @@ class PullRequest:
 
 
 class GitHub:
+    forge = "GitHub"
+
     def __init__(self, slug: str, token: Optional[str] = None):
         self.slug = slug
         self.token = token
@@ -189,6 +196,9 @@ class GitHub:
             })
         except GitHubError:
             pass
+
+    def pr_state(self, number: int) -> str:
+        return self.request("GET", f"/repos/{self.slug}/pulls/{number}").get("state", "")
 
     def list_prs(self, state: str = "open", limit: int = 30) -> List[Dict[str, Any]]:
         return self.request("GET", f"/repos/{self.slug}/pulls?state={state}&per_page={limit}")

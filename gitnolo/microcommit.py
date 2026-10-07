@@ -12,6 +12,11 @@ verified to equal the working tree snapshot byte for byte.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "difflib", "fnmatch", "hashlib", "heapq", "gitnolo", "gitnolo.gitcore", "gitnolo.guard",
+]
+
 import difflib
 import fnmatch
 import hashlib
@@ -22,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import messages
+from .guard import find_secret
 from .gitcore import FileChange, GitError, Repo, fi_data, fi_path, tz_offset
 
 SENSITIVE_PATTERNS = [
@@ -172,7 +178,7 @@ def _decode(data: Optional[bytes]) -> Optional[List[str]]:
 
 
 def collect(
-    repo: Repo, paths: Optional[Sequence[str]] = None, base: Optional[str] = ""
+    repo: Repo, paths: Optional[Sequence[str]] = None, base: Optional[str] = "", scan_secrets: bool = False
 ) -> Tuple[Optional[str], List[FilePlan], List[Tuple[str, str]]]:
     """Snapshots `base` (default HEAD) and working-tree contents for all changed files."""
     if base == "":
@@ -209,6 +215,10 @@ def collect(
             kind = "add" if old is None else "modify"
             if len(new) > MAX_FILE_BYTES:
                 skipped.append((c.path, f"larger than {MAX_FILE_BYTES // (1024 * 1024)} MB"))
+                continue
+            secret = find_secret(new, old) if scan_secrets else None
+            if secret:
+                skipped.append((c.path, f"contains a {secret}; commit it manually if intended"))
                 continue
         old_mode = old_modes.get(c.path)
         if old == new and old_mode == new_mode:
@@ -306,12 +316,13 @@ def plan(
     paths: Optional[Sequence[str]] = None,
     message_hook: Optional[Callable[[FilePlan, List[str], List[str]], Optional[str]]] = None,
     base: Optional[str] = "",
+    scan_secrets: bool = False,
 ) -> Plan:
     """
     Builds a commit plan with (up to) `target` commits on top of `base` (default HEAD).
     target <= 0 means one commit per natural hunk.
     """
-    base, files, skipped = collect(repo, paths, base)
+    base, files, skipped = collect(repo, paths, base, scan_secrets)
     natural = sum(f.unit_count() for f in files)
     max_possible = sum(sum(op.capacity for op in f.ops) if f.splittable else 1 for f in files)
     if target <= 0:

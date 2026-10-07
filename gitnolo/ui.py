@@ -5,6 +5,11 @@ status dots and tree connectors instead of emojis, dim secondary text.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "rich", "rich.console", "rich.panel", "rich.table", "rich.text", "rich.theme", "gitnolo.logo",
+]
+
 import os
 import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -121,6 +126,8 @@ def error(text: str) -> None:
 
 def emit_printer(kind: str, text: str) -> None:
     """Default Pipeline event sink for one-shot commands."""
+    if kind == "stage":
+        return  # map-only progress marker
     if kind == "step":
         step(text)
     elif kind == "ok":

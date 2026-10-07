@@ -10,6 +10,8 @@ def cfg(**kw):
     c.ai_commit_messages = c.ai_pr_summary = c.ai_issue_refine = False
     for k, v in kw.items():
         setattr(c, k, v)
+    if "private_commit_min" not in kw:
+        c.private_commit_min = c.private_commit_target  # deterministic counts; the random range is tested separately
     return c
 
 

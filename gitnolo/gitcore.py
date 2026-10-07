@@ -8,6 +8,11 @@ operations stay fast and never touch the user's working tree.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "shutil", "subprocess",
+]
+
 import os
 import shutil
 import stat
@@ -101,14 +106,18 @@ class Repo:
         env: Optional[Dict[str, str]] = None,
         timeout: Optional[float] = 120,
     ) -> Tuple[int, bytes, bytes]:
-        proc = subprocess.run(
-            [GIT, *args],
-            cwd=self.root,
-            input=input,
-            capture_output=True,
-            env=git_env(env),
-            timeout=timeout,
-        )
+        try:
+            proc = subprocess.run(
+                [GIT, *args],
+                cwd=self.root,
+                input=input,
+                capture_output=True,
+                env=git_env(env),
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            hint = " (a pre-push hook may be scanning every commit)" if args and args[0] == "push" else ""
+            raise GitError(f"git {args[0] if args else ''} timed out after {timeout:.0f}s{hint}")
         return proc.returncode, proc.stdout, proc.stderr
 
     def ok(self, *args: str) -> bool:
@@ -382,7 +391,7 @@ class Repo:
         if set_upstream:
             args.append("-u")
         args += [remote, f"{src}:refs/heads/{dst_branch}"]
-        return self.run(*args, timeout=180)
+        return self.run(*args, timeout=900)
 
     def fetch(self, remote: str = "origin", *refs: str) -> bool:
         code, _, _ = self.run_bytes("fetch", "--quiet", "--prune", remote, *refs, timeout=120)

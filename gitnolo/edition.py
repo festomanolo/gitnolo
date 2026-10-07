@@ -10,3 +10,17 @@ COMMUNITY_MAX_COMMITS = 15
 
 def is_community() -> bool:
     return EDITION == "community"
+
+
+def public_repo_error(repo) -> str:
+    """Community build: '' when `repo` is a public GitHub/GitLab repo, else why writing is refused."""
+    if not is_community():
+        return ""
+    from .config import AppConfig
+    from .gitlab import for_remote
+
+    gh = for_remote(repo.remote_url(), AppConfig.load())
+    if not gh:
+        return f"{repo.name} has no GitHub/GitLab remote; gitnolo community works on public repositories only"
+    private, source = gh.visibility()
+    return f"{repo.name} is private ({source}); gitnolo community works on public repositories only" if private else ""

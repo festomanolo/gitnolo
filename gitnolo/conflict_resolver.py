@@ -3,6 +3,12 @@ GitLens-style conflict resolver: parses conflict hunks, shows current vs
 incoming side by side, and can synthesize a merge with the configured AI model.
 """
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "re", "subprocess", "tempfile", "rich.panel", "rich.table", "rich.syntax", "rich.prompt",
+    "rich.text", "rich", "gitnolo.gitcore", "gitnolo.ollama_client", "gitnolo.ui",
+]
+
 import os
 import re
 import subprocess

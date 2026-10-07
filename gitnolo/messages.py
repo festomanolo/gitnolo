@@ -8,6 +8,11 @@ name the symbols touched, so each message is specific without any model call.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "re",
+]
+
 import os
 import re
 from typing import Iterable, List, Optional, Sequence

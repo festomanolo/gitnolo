@@ -5,7 +5,7 @@ other CLI agents across every repository on your machine. The moment an agent fi
 task, it splits the work into up to 15 focused commits, pushes a branch, opens a pull
 request, merges it, and files issues for problems the agent reported but did not fix.
 
-Community edition: works on **public GitHub repositories** only.
+Community edition: works on **public GitHub and GitLab repositories** only.
 
 ```
              ▄██              ✻ Welcome to gitnolo
@@ -33,6 +33,8 @@ creates a private environment in `~/.gitnolo/app` and links `gitnolo` into
 
 GitHub access is taken from `GITHUB_TOKEN`, `gh auth token`, or the credential
 `git push` already uses. To set a token explicitly: `gitnolo config set github_token <token>`.
+GitLab (gitlab.com or self-hosted via `GITNOLO_GITLAB_HOSTS=git.example.com`) uses
+`GITLAB_TOKEN`, `glab`, or `gitnolo config set gitlab_token <token>`.
 
 ## Use
 
@@ -70,6 +72,18 @@ stopped early goes to a draft PR and is never merged until the agent completes.
 - **Never touches your files.** Your working tree is untouched while agents keep
   editing.
 - **Skips secrets.** `.env`, keys and certificates are never committed.
+
+## Terminal git client
+
+Run `gitnolo` and pick with the arrow keys; no commands to remember.
+
+```
+gitnolo graph        interactive color-coded commit graph with per-commit actions
+gitnolo ops          stage, commit, push, pull, switch, merge, tag, stash
+gitnolo conflict     side-by-side 3-way merge editor (ours | base | theirs), AI merge
+gitnolo rebase       reorder (space + arrows), squash, fixup, reword, drop
+gitnolo explain X    AI explains a commit, a file's history, or FILE:START-END
+```
 
 ## GitLens in the terminal
 

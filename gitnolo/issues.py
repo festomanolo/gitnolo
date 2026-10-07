@@ -9,6 +9,11 @@ ones, which keeps hallucinated issues out of the tracker.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "hashlib", "re",
+]
+
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -201,3 +206,93 @@ def _context(message: str, line: str, radius: int = 3) -> str:
         if line[:40] in _clean(l):
             return "\n".join(lines[max(0, i - radius) : i + radius + 1]).strip()
     return ""
+
+
+# ---------------------------------------------------------------- live mode
+# Messages streamed mid-turn are full of working notes ("let me check why the
+# test fails"). Those describe what the agent is about to do, not a problem it
+# is reporting, so live extraction drops them.
+TRANSIENT_RE = re.compile(
+    r"\b(let me|let's|i'll|i will|i'm going to|i am going to|going to (?:check|look|try|fix|investigate)|"
+    r"next,? i|now i|first,? i|i need to (?:check|look|see|find|investigate|read)|i should (?:check|look)|"
+    r"checking|looking (?:at|into)|investigating)\b",
+    re.I,
+)
+ISSUE_REF_RE = re.compile(r"\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)\s+#(\d+)\b", re.I)
+STOP_WORDS = {
+    "the", "and", "for", "with", "when", "that", "this", "from", "into", "now", "still", "but", "are", "was", "were",
+    "has", "have", "had", "not", "its", "it's", "our", "your", "their", "there", "then", "than", "also", "just",
+    "all", "any", "some", "both", "each", "more", "less", "after", "before", "because", "which", "while", "only",
+    "fixed", "fix", "fixes", "fixing", "resolved", "resolve", "addressed", "works", "work", "working", "passes",
+    "pass", "passed", "passing", "fails", "fail", "failed", "failing", "failure", "error", "errors", "issue", "issues",
+    "bug", "bugs", "problem", "problems", "broken", "gone", "longer", "correctly", "properly", "successfully",
+    "again", "should", "would", "could", "can", "cannot", "couldn", "does", "doesn", "did", "didn", "done",
+    "returns", "return", "returned", "todo", "known", "remains", "remaining", "untested", "tested", "test", "tests",
+    "missing", "added", "add", "updated", "update", "handle", "handles", "handled", "case", "cases", "now",
+}
+
+
+def _stem(w: str) -> str:
+    for suf in ("ing", "ed", "es", "s", "ly"):
+        if len(w) > len(suf) + 3 and w.endswith(suf):
+            w = w[: -len(suf)]
+            break
+    return w[:7]
+
+
+def keywords(text: str) -> set:
+    """Topic words of a line: no stop words, no problem/resolution verbs, crudely stemmed."""
+    words = re.findall(r"[a-z0-9][a-z0-9_.-]*[a-z0-9]|[a-z0-9]{2,}", (text or "").lower())
+    return {_stem(w) for w in words if len(w) > 2 and w not in STOP_WORDS}
+
+
+def live_candidates(message: str) -> List[str]:
+    """Problem lines from any agent message, including mid-turn ones."""
+    out = []
+    for c in candidates(message):
+        if TRANSIENT_RE.search(c) or c.rstrip().endswith("?"):
+            continue
+        out.append(c)
+    return out
+
+
+def resolution_lines(message: str) -> List[str]:
+    """Lines where the agent states that something is now fixed or working."""
+    text = CODE_FENCE_RE.sub("", message or "")
+    out = []
+    for raw in text.splitlines():
+        line = _clean(raw)
+        if len(line) < 8 or len(line) > 400 or META_RE.search(line) or TRANSIENT_RE.search(line):
+            continue
+        fixed = RESOLVED_RE.search(line) or ISSUE_REF_RE.search(line) or re.match(r"^(?:fix(?:ed)?|resolved)\s*:", line, re.I)
+        if fixed and score(line) < 2:
+            out.append(line)
+    return out
+
+
+def referenced_numbers(line: str) -> List[int]:
+    return [int(n) for n in ISSUE_REF_RE.findall(line or "")]
+
+
+def resolves(line: str, issue_title: str, issue_source: str = "") -> bool:
+    """True when a resolution line is about the same topic as an open issue."""
+    a = keywords(line)
+    b = keywords(issue_title) | keywords(issue_source)
+    if not a or not b:
+        return False
+    shared = a & b
+    return len(shared) >= 2 and len(shared) / min(len(a), len(b)) >= 0.5
+
+
+def draft_for(line: str, repo_name: str = "", agent: str = "", session_title: str = "", live: bool = False) -> IssueDraft:
+    labels = ["agent-reported"] + (["bug"] if BUG_WORDS.search(line) else [])
+    when = "while working" if live else "after finishing a task"
+    body = (
+        f"Reported by **{agent or 'coding agent'}** {when}"
+        + (f" (\"{session_title}\")" if session_title else "")
+        + (f" in `{repo_name}`" if repo_name else "")
+        + ".\n\n"
+        f"> {line}\n\n"
+        "_Opened automatically by gitnolo; it will be closed automatically when the agent reports it fixed._"
+    )
+    return IssueDraft(title=_title(line), body=body, labels=labels, source_line=line)

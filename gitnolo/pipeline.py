@@ -17,8 +17,15 @@ Branch strategy
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "fcntl", "re", "gitnolo", "gitnolo.ai", "gitnolo.config", "gitnolo.github", "gitnolo.gitcore",
+    "gitnolo.ollama_client", "gitnolo.state",
+]
+
 import fcntl
 import os
+import random
 import re
 import time
 from collections import Counter
@@ -28,9 +35,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import issues as issue_mod
 from . import microcommit as mc
 from . import edition
+from . import guard as guard_mod
 from .ai import make_client
 from .config import AppConfig
 from .github import GitHub, GitHubError
+from .gitlab import for_remote as forge_for_remote
 from .gitcore import GitError, Repo
 from .ollama_client import OllamaClient
 from .state import State
@@ -52,6 +61,7 @@ class RunOptions:
     final_message: str = ""
     partial: bool = False          # the agent stopped before finishing: PR as draft, never auto-merge
     stop_reason: str = ""
+    related_issues: List[Tuple[int, str, str]] = field(default_factory=list)  # already filed (live issues)
     confirm: Optional[Callable[["mc.Plan", Dict[str, Any]], bool]] = None
 
 
@@ -76,6 +86,7 @@ class RunResult:
     elapsed: float = 0.0
     is_private: Optional[bool] = None
     mode: str = ""
+    guard: List[str] = field(default_factory=list)  # test-tampering findings that blocked auto-merge
 
 
 class RepoLock:
@@ -105,11 +116,14 @@ def _slugify(text: str, limit: int = 32) -> str:
     return s[:limit].rstrip("-") or "update"
 
 
-def commit_target(config: AppConfig, is_private: bool, natural: int) -> int:
+def commit_target(config: AppConfig, is_private: bool, natural: int, rng: Optional[random.Random] = None) -> int:
+    """Commit count for one change. Private repos draw a fresh number in [min, target] every run."""
     if edition.is_community():
         return max(1, min(edition.COMMUNITY_MAX_COMMITS, int(config.public_commit_max)))
     if is_private:
-        return max(1, int(config.private_commit_target))
+        hi = max(1, int(config.private_commit_target))
+        lo = max(1, min(hi, int(config.private_commit_min)))
+        return (rng or random).randint(lo, hi)
     lo, hi = int(config.public_commit_min), int(config.public_commit_max)
     return max(lo, min(hi, natural))
 
@@ -189,7 +203,7 @@ class Pipeline:
             raise GitError(f"unresolved conflicts in {repo.name}; run gitnolo conflict")
 
         remote = repo.remote_url()
-        gh = GitHub.for_remote(remote, cfg.github_token) if remote else None
+        gh = forge_for_remote(remote, cfg) if remote else None
         is_private, vis_source = self._visibility(gh)
         result.is_private = is_private
         if edition.is_community() and (is_private or not gh):
@@ -217,12 +231,13 @@ class Pipeline:
         cont = self._reconcile_open_branch(repo, gh if can_api else None, default, current)
         base = cont["tip"] if cont else repo.head()
 
+        emit("stage", "analyze")
         emit("step", f"Analyzing {repo.name}")
         llm = self.llm() if (opts.use_ai and (cfg.ai_commit_messages or cfg.ai_pr_summary or cfg.ai_issue_refine)) else None
         if llm:
             llm.set_budget(cfg.ai_budget_seconds)
 
-        probe = mc.plan(repo, 0, base=base)
+        probe = mc.plan(repo, 0, base=base, scan_secrets=cfg.guard_secrets)
         if not probe.commits:
             for p, why in probe.skipped:
                 emit("warn", f"skipped {p}: {why}")
@@ -232,14 +247,20 @@ class Pipeline:
             emit("info", "Working tree clean, nothing to commit")
             return
         natural = len(probe.commits)
-        target = opts.target if opts.target is not None else commit_target(cfg, is_private, natural)
+        override = (cfg.repo_commit_targets or {}).get(repo.root)
+        if opts.target is not None:
+            target = opts.target
+        elif override:
+            target = int(override)
+        else:
+            target = commit_target(cfg, is_private, natural)
         if edition.is_community():
             target = min(target, edition.COMMUNITY_MAX_COMMITS)
 
         hook = None
         if llm and cfg.ai_commit_messages and not is_private and target <= 40:
             hook = self._ai_subject_hook(llm)
-        plan = mc.plan(repo, target, base=base, message_hook=hook)
+        plan = mc.plan(repo, target, base=base, message_hook=hook, scan_secrets=cfg.guard_secrets)
         add, rem = plan.stats()
         result.files, result.added, result.removed = len(plan.files), add, rem
         result.skipped = plan.skipped
@@ -251,6 +272,13 @@ class Pipeline:
         )
         for p, why in plan.skipped:
             emit("warn", f"skipped {p}: {why}")
+        if cfg.guard_tests:
+            for finding in guard_mod.review_tests(plan):
+                result.guard.append(str(finding))
+                emit("warn", f"needs review, {finding}")
+            if result.guard and want_merge:
+                want_merge = False
+                emit("warn", "auto-merge held: the change weakens tests")
 
         if current and current != default:
             mode = "feature-branch"
@@ -274,9 +302,13 @@ class Pipeline:
             return
 
         # Issues first so the PR can reference them.
+        result.issues = list(opts.related_issues)
         if want_issues and can_api and opts.final_message and not opts.partial:
-            result.issues = self._file_issues(repo, gh, opts, llm)  # type: ignore[arg-type]
+            emit("stage", "issues")
+            known = {n for n, _, _ in result.issues}
+            result.issues += [i for i in self._file_issues(repo, gh, opts, llm) if i[0] not in known]  # type: ignore[arg-type]
 
+        emit("stage", "commit")
         emit("step", f"Writing {len(plan.commits)} commits")
         body = None
         if opts.agent:
@@ -295,6 +327,7 @@ class Pipeline:
             result.branch = current or "HEAD"
             repo.delete_ref(mc.WORK_REF)
             if want_push and remote and current:
+                emit("stage", "push")
                 emit("step", f"Pushing {current}")
                 try:
                     repo.push(current, current, set_upstream=True)
@@ -334,6 +367,7 @@ class Pipeline:
         repo.update_ref(f"refs/heads/{branch}", res.tip, old, "gitnolo: work branch")
         repo.delete_ref(mc.WORK_REF)
         result.branch = branch
+        emit("stage", "push")
         emit("step", f"Pushing {branch}")
         repo.push(branch, branch)
         result.pushed = True
@@ -375,12 +409,14 @@ class Pipeline:
                 title = f"WIP: {title}"
                 body = (f"> Agent stopped before finishing ({opts.stop_reason or 'interrupted'}). "
                         "This draft keeps the partial work safe; gitnolo continues and merges it when the agent completes.\n\n" + body)
+            emit("stage", "pr")
             emit("step", "Opening pull request" + (" (draft)" if opts.partial else ""))
             pr = gh.create_pr(title, body, head, base, draft=opts.partial)
             emit("ok", f"PR #{pr.number} {pr.url}")
         result.pr_url, result.pr_number = pr.url, pr.number
         if not want_merge:
             return
+        emit("stage", "merge")
         emit("step", f"Merging PR #{pr.number} ({self.config.merge_method})")
         ok, detail = gh.merge_pr(pr.number, self.config.merge_method)
         if ok:
@@ -395,6 +431,7 @@ class Pipeline:
     def _sync_default(self, repo: Repo, default: str, res: "mc.CommitResult") -> None:
         """Fast-forwards the local default branch to the merged remote, leaving agent edits intact."""
         emit = self.emit
+        emit("stage", "sync")
         if not repo.fetch("origin", default):
             emit("warn", "fetch failed; local branch not fast-forwarded")
             return
@@ -435,8 +472,7 @@ class Pipeline:
             return None
         if gh and info.get("pr"):
             try:
-                pr = gh.request("GET", f"/repos/{gh.slug}/pulls/{info['pr']}")
-                if pr.get("state") != "open":
+                if gh.pr_state(info["pr"]) != "open":
                     self.state.set_open_branch(repo.root, None)
                     return None
             except GitHubError:
@@ -496,6 +532,9 @@ class Pipeline:
         ), ""]
         if bullets:
             lines += ["## Changes", ""] + [f"- {b}" for b in bullets] + [""]
+        if result.guard:
+            lines += ["## Needs review", "", "gitnolo held the auto-merge because this change weakens tests:", ""]
+            lines += [f"- `{g}`" for g in result.guard] + [""]
         lines += ["## Files", ""]
         nums = {}
         for f in plan.files:
@@ -540,8 +579,9 @@ class Pipeline:
             emit("warn", f"issues unavailable: {e}")
             return []
         created: List[Tuple[int, str, str]] = []
+        tracked = self.state.open_ledger(repo.root)
         for d in drafts:
-            if self.state.issue_known(repo.root, d.fingerprint):
+            if self.state.issue_known(repo.root, d.fingerprint) or any(issue_mod.similar(d.title, e["title"]) for e in tracked):
                 continue
             dup = next((i for i in existing if issue_mod.similar(d.title, i.get("title", ""))), None)
             if dup:
@@ -554,6 +594,11 @@ class Pipeline:
                 emit("warn", f"could not open issue: {e}")
                 break
             self.state.add_issue(repo.root, d.fingerprint, it["number"])
+            self.state.ledger_add(repo.root, {
+                "status": "open", "title": d.title, "source": d.source_line, "fp": d.fingerprint, "labels": d.labels,
+                "agent": opts.agent, "task": opts.session_title, "number": it["number"], "url": it.get("html_url", ""),
+                "published_at": time.time(),
+            })
             created.append((it["number"], it.get("html_url", ""), d.title))
             emit("ok", f"Issue #{it['number']} {d.title[:70]}")
         return created

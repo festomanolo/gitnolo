@@ -7,6 +7,11 @@ stashes  worktrees  contributors  hotspots  search  show  timeline  insights
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "rich.syntax", "rich.text", "gitnolo", "gitnolo.gitcore",
+]
+
 import os
 import time
 from collections import Counter, defaultdict

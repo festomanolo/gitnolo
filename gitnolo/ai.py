@@ -15,6 +15,11 @@ and conflict synthesis. That is ~2 calls per pipeline run.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "json", "urllib.error", "urllib.request", "gitnolo.config", "gitnolo.ollama_client",
+]
+
 import json
 import os
 import time
@@ -176,6 +181,7 @@ class OpenRouterClient(OllamaClient):
             "messages": messages,
             "temperature": 0.2,
             "max_tokens": max_tokens,
+            "reasoning": {"effort": "low", "exclude": True},  # reasoning models otherwise spend max_tokens thinking
         }
         if json_mode:
             body["response_format"] = {"type": "json_object"}

@@ -4,6 +4,12 @@ gitnolo command line.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "argparse", "rich.prompt", "rich.text", "gitnolo", "gitnolo.agents", "gitnolo.config",
+    "gitnolo.gitcore", "gitnolo.state",
+]
+
 import argparse
 import os
 import sys
@@ -13,7 +19,7 @@ from typing import Any, Dict, List, Optional
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
 
-from . import __version__, lens, ui
+from . import __version__, edition, lens, ui
 from .agents import FINISHED, Session, Tracker
 from .config import AppConfig
 from .gitcore import GitError, Repo
@@ -160,9 +166,11 @@ def cmd_agents(args: argparse.Namespace, config: AppConfig) -> int:
 def cmd_issues(args: argparse.Namespace, config: AppConfig) -> int:
     from . import issues
     from .ai import make_client
-    from .github import GitHub
+    from .gitlab import for_remote as forge_for_remote
 
     repo = _repo(args.repo)
+    if args.list:
+        return _issues_list(repo, State(), args.all)
     s = latest_session(repo.root, config)
     if not s or not s.final_message:
         ui.warn("No finished agent report found for this repository")
@@ -177,9 +185,9 @@ def cmd_issues(args: argparse.Namespace, config: AppConfig) -> int:
         ui.detail(f"{d.title}  [{', '.join(d.labels)}]", "")
     if args.dry_run:
         return 0
-    gh = GitHub.for_remote(repo.remote_url(), config.github_token)
+    gh = forge_for_remote(repo.remote_url(), config)
     if not gh or not gh.token:
-        ui.error("No GitHub remote or token available")
+        ui.error("No GitHub/GitLab remote or token available")
         return 1
     if not args.yes and not Confirm.ask(Text(f"  Open {len(drafts)} issue(s) on {gh.slug}?", style="accent"), default=True):
         return 0
@@ -197,13 +205,30 @@ def cmd_issues(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
+def _issues_list(repo: Repo, state: State, show_all: bool) -> int:
+    entries = state.ledger(repo.root)
+    if not show_all:
+        entries = [e for e in entries if e.get("status") in ("snapped", "open", "local", "closing")]
+    ui.step(f"Agent-reported issues in {repo.name}" + ("" if show_all else " (open; --all for history)"))
+    styles = {"snapped": "info", "open": "warn", "local": "warn", "closing": "ok", "closed": "ok", "resolved": "faint"}
+    t = ui.table("status", "#", "title*", "agent", "age")
+    for e in reversed(entries[-60:]):
+        t.add_row(Text(e.get("status", ""), style=styles.get(e.get("status", ""), "muted")),
+                  Text(str(e.get("number") or ""), style="hash"), e["title"], Text(e.get("agent") or "", style="muted"),
+                  Text(ui.ago(e.get("t")), style="faint"))
+    if not entries:
+        t.add_row("", "", Text("nothing tracked yet; gitnolo watch snaps problems as agents report them", style="muted"), "", "")
+    ui.console.print(t)
+    return 0
+
+
 def cmd_pr(args: argparse.Namespace, config: AppConfig) -> int:
-    from .github import GitHub
+    from .gitlab import for_remote as forge_for_remote
 
     repo = _repo(args.repo)
-    gh = GitHub.for_remote(repo.remote_url(), config.github_token)
+    gh = forge_for_remote(repo.remote_url(), config)
     if not gh or not gh.token:
-        ui.error("No GitHub remote or token available")
+        ui.error("No GitHub/GitLab remote or token available")
         return 1
     if args.action == "merge":
         if not args.number:
@@ -232,8 +257,20 @@ def cmd_supervise(args: argparse.Namespace, config: AppConfig) -> int:
         ui.error("usage: gitnolo supervise <agent command...>")
         return 2
     ui.step(f"Supervising {' '.join(args.agent_cmd)}")
-    ui.detail("auto-approving prompts; destructive commands are left to you", "faint")
-    code = supervise_command(args.agent_cmd, auto_accept=True, notify=ui.notify if config.notify else None)
+    rapid = config.rapid_response and not args.no_rapid
+    ui.detail("auto-approving prompts; destructive commands are left to you"
+              + (f"; questions get option 1 after {int(config.rapid_choice_delay)}s once you are away "
+                 f"{int(config.rapid_away_seconds)}s" if rapid else ""), "faint")
+    try:
+        from . import checkpoints
+
+        cp = checkpoints.create(Repo("."), f"before {args.agent_cmd[0]} (supervise)", config.checkpoint_keep) if config.checkpoints else None
+        if cp:
+            ui.detail(f"checkpoint {cp.short}; undo everything with gitnolo rewind", "faint")
+    except GitError:
+        pass
+    code = supervise_command(args.agent_cmd, auto_accept=True, notify=ui.notify if config.notify else None, rapid=rapid,
+                             away_seconds=config.rapid_away_seconds, choice_delay=config.rapid_choice_delay)
     ui.detail(f"{args.agent_cmd[0]} exited with code {code}")
     try:
         repo = Repo(".")
@@ -250,11 +287,133 @@ def cmd_supervise(args: argparse.Namespace, config: AppConfig) -> int:
     return code
 
 
+def cmd_map(args: argparse.Namespace, config: AppConfig) -> int:
+    from rich.console import Group
+    from rich.live import Live
+
+    from . import scene
+
+    tr = Tracker(config.monitored_agents, config.transcript_horizon_hours)
+    lanes = scene.Lanes()
+
+    def frame():
+        rows = tr.visible()
+        head = Text.assemble((ui.STAR + " ", "accent"), ("gitnolo", "accent.bold"), ("  map", "bold"),
+                             ("   ", ""), (f"{sum(1 for r in rows if r.state in ('working', 'running'))} driving", "accent"),
+                             ("  ", ""), (f"{sum(1 for r in rows if r.state == 'waiting')} waiting", "warn"),
+                             ("  ", ""), (f"{sum(1 for r in rows if r.state == 'finished')} parked", "ok"))
+        body = lanes.render(rows, ui.console.width, limit=args.limit) or [Text("  no agents on the road", style="muted")]
+        return Group(Text(""), head, Text(""), *body, Text(""), Text("  ctrl+c to stop", style="faint"))
+
+    tr.poll()
+    try:
+        with Live(frame(), console=ui.console, refresh_per_second=10) as live:
+            n = 0
+            while True:
+                time.sleep(0.1)
+                n += 1
+                if n % 8 == 0:
+                    tr.poll()
+                live.update(frame())
+    except KeyboardInterrupt:
+        return 0
+
+
+def cmd_rewind(args: argparse.Namespace, config: AppConfig) -> int:
+    from . import checkpoints
+
+    repo = _repo(args.repo)
+    if args.save is not None:
+        cp = checkpoints.create(repo, args.save or "manual checkpoint", config.checkpoint_keep)
+        ui.ok(f"checkpoint {cp.short}" if cp else "nothing changed since the last checkpoint")
+        return 0
+    cps = checkpoints.list_all(repo)
+    if not cps:
+        ui.warn("No checkpoints yet. gitnolo watch takes one whenever an agent starts a turn; gitnolo rewind --save takes one now")
+        return 1
+    if not args.checkpoint:
+        ui.step(f"Checkpoints in {repo.name} (newest first)")
+        t = ui.table("#", "taken", "label*", "files differ")
+        for i, cp in enumerate(cps[: args.limit], 1):
+            try:
+                changed, added, deleted = checkpoints.diff_from_now(repo, cp) if i <= 10 else ([], [], [])
+                diff = f"{len(changed) + len(added) + len(deleted)}" if i <= 10 else ""
+            except GitError:
+                diff = "?"
+            t.add_row(Text(str(i), style="accent"), Text(ui.ago(cp.t) + " ago", style="muted"), cp.label, Text(diff, style="warn"))
+        ui.console.print(t)
+        ui.detail("restore with: gitnolo rewind <#>  (your current state is saved first)", "faint")
+        return 0
+    cp = checkpoints.find(repo, args.checkpoint)
+    if not cp:
+        ui.error(f"no checkpoint {args.checkpoint}")
+        return 1
+    changed, added, deleted = checkpoints.diff_from_now(repo, cp)
+    if not (changed or added or deleted):
+        ui.ok("working tree already matches that checkpoint")
+        return 0
+    ui.step(f"Rewind {repo.name} to {cp.label} ({ui.ago(cp.t)} ago)")
+    ui.detail(f"{len(changed)} restored · {len(added)} new files removed · {len(deleted)} deleted files brought back")
+    if not args.yes and not Confirm.ask(Text("  Rewind?", style="accent"), default=False):
+        return 0
+    safety, n = checkpoints.restore(repo, cp)
+    ui.ok(f"rewound {n} files")
+    if safety:
+        ui.detail(f"undo the rewind with: gitnolo rewind {safety.short}", "faint")
+    return 0
+
+
+def cmd_brief(args: argparse.Namespace, config: AppConfig) -> int:
+    from . import brief
+
+    repo = _repo(args.repo)
+    tr = Tracker(config.monitored_agents, 48, processes=False)
+    tr.poll()
+    text = brief.build(repo, State(), list(tr.sessions.values()), args.days)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as f:
+            f.write(text)
+        ui.ok(f"brief written to {args.out}")
+    elif args.copy and sys.platform == "darwin":
+        import subprocess
+
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=False)
+        ui.ok(f"brief copied to the clipboard ({len(text.splitlines())} lines)")
+    else:
+        print(text)
+    return 0
+
+
+def cmd_hooks(args: argparse.Namespace, config: AppConfig) -> int:
+    from . import hooks
+
+    if args.action == "install":
+        added = hooks.install()
+        ui.ok(("installed" if added else "already installed") + f" in {ui.short_path(hooks.SETTINGS, 60)}")
+        ui.detail(f"Claude Code tool calls are approved instantly (scope: {config.rapid_hook_scope}); destructive "
+                  "commands and sensitive paths still ask you. New sessions pick it up.", "faint")
+        return 0
+    if args.action == "uninstall":
+        ui.ok("removed" if hooks.uninstall() else "was not installed")
+        return 0
+    on = hooks.installed()
+    ui.step("Rapid response")
+    ui.detail(f"claude code hook   {'installed' if on else 'not installed (gitnolo hooks install)'}", "ok" if on else "muted")
+    ui.detail(f"scope              {config.rapid_hook_scope}  (gitnolo config set rapid_hook_scope edits|all)")
+    ui.detail(f"supervise          questions answered with option 1 after {int(config.rapid_choice_delay)}s, "
+              f"once you are away {int(config.rapid_away_seconds)}s" if config.rapid_response else "supervise          off")
+    return 0
+
+
 def cmd_conflict(args: argparse.Namespace, config: AppConfig) -> int:
     from .ai import make_client
     from .conflict_resolver import ConflictResolver
 
     repo = _repo(args.repo)
+    from . import tui
+
+    if tui.interactive():
+        return 0 if tui.merge_editor(repo, make_client(config)) else 1
     return 0 if ConflictResolver(repo, make_client(config)).resolve_interactive() else 1
 
 
@@ -320,6 +479,16 @@ def cmd_doctor(args: argparse.Namespace, config: AppConfig) -> int:
     login = GitHub("x/y", token).viewer() if token else None
     ui.detail(f"github     {'token ok, signed in as ' + login if login else ('token found but rejected' if token else 'no token (set GITHUB_TOKEN or gitnolo config set github_token ...)')}",
               "ok" if login else "warn")
+    from .gitlab import GitLab
+
+    try:
+        gl = GitLab.for_remote(Repo(".").remote_url(), config.gitlab_token)
+    except GitError:
+        gl = None
+    if gl:
+        who = gl.viewer() if gl.token else None
+        ui.detail(f"gitlab     {gl.host}: " + ("signed in as " + who if who else "no working token (set GITLAB_TOKEN)"),
+                  "ok" if who else "warn")
     client = make_client(config)
     ui.detail(f"ai         {type(client).__name__.replace('Client', '') + ' · ' + str(client.model_name) if client else 'off (heuristics only)'}",
               "ok" if client else "muted")
@@ -349,6 +518,10 @@ def cmd_lens(args: argparse.Namespace, config: AppConfig) -> int:
             else:
                 lens.file_history(repo, path, args.limit)
         elif c == "graph":
+            from . import tui
+
+            if tui.interactive() and not args.current:
+                return tui.graph(repo, max(args.limit, 300))
             lens.graph(repo, args.limit, not args.current)
         elif c == "compare":
             lens.compare(repo, args.a, args.b or "HEAD")
@@ -401,14 +574,127 @@ def _parse_range(target: str):
 PALETTE = [
     ("w", "watch", "Live dashboard; auto-commit, PR and merge when agents finish"),
     ("c", "commit", "Micro-commit this repo now (with agent context)"),
+    ("o", "ops", "Stage, commit, push, pull, branch, merge, tag: no commands"),
+    ("e", "rebase", "Interactive rebase: reorder, squash, reword, drop"),
+    ("x", "explain", "AI explains the latest commit (or `gitnolo explain FILE`)"),
     ("a", "agents", "Which agent is doing what, where"),
     ("i", "insights", "Repository overview: activity, hotspots, contributors"),
     ("g", "graph", "Commit graph"),
     ("b", "branches", "Branches with upstream sync state"),
+    ("m", "map", "Live map: every agent as a car on its own road"),
+    ("u", "rewind", "Undo an agent's work: restore a checkpoint"),
+    ("f", "brief", "Handoff brief for your next agent session"),
     ("r", "conflict", "Resolve merge conflicts"),
-    ("d", "doctor", "Check GitHub, AI and agent detection"),
+    ("d", "doctor", "Check GitHub/GitLab, AI and agent detection"),
     ("q", "quit", ""),
 ]
+
+
+def _n(count: int, word: str) -> str:
+    return f"{count:,} {word}{'' if count == 1 else 's'}"
+
+
+def _home_lines(config: AppConfig, rows: List[Session], repo: Optional[Repo], state: State) -> List[Text]:
+    """What matters right now, in priority order, instead of static settings."""
+    pairs: List[Any] = []
+    if repo:
+        vis = None
+        slug = None
+        try:
+            from .github import parse_slug
+
+            slug = parse_slug(repo.remote_url())
+            vis = state.visibility(slug, ttl=30 * 86400) if slug else None
+        except GitError:
+            pass
+        where = f"{repo.name} on {repo.branch_display()}"
+        if vis is not None:
+            where += " · private" if vis else " · public"
+        elif not slug:
+            from .gitlab import parse_remote
+
+            where += " · GitLab" if parse_remote(repo.remote_url()) else " · no GitHub/GitLab remote"
+        pairs.append(("repo", where, "path"))
+    else:
+        pairs.append(("repo", "not in a repository; watching every repo on this machine", "muted"))
+
+    waiting = [s for s in rows if s.state == "waiting"]
+    busy = [s for s in rows if s.state in ("working", "running")]
+    stopped = [s for s in rows if s.state in ("error", "limited", "closed")]
+    if waiting or busy or stopped:
+        parts = [f"{s.agent} waiting for you in {s.repo_name}" for s in waiting[:2]]
+        parts += [f"{s.agent} working in {s.repo_name}" for s in busy[:3 - len(parts)]]
+        parts += [f"{s.agent} stopped in {s.repo_name} ({s.stop_reason})" for s in stopped[:max(0, 3 - len(parts))]]
+        pairs.append(("agents", " · ".join(parts), "warn" if waiting or stopped else "accent"))
+    elif rows:
+        last = max(rows, key=lambda s: s.updated)
+        pairs.append(("agents", f"none running · {last.agent} {last.state} in {last.repo_name} {ui.ago(last.updated)} ago", "muted"))
+    else:
+        pairs.append(("agents", "none seen in the last 3 hours", "muted"))
+
+    dirty = 0
+    if repo:
+        try:
+            stat = repo.numstat()
+            dirty = len(repo.changes())  # numstat misses untracked files
+            if dirty:
+                add = sum(a for a, _ in stat.values())
+                rem = sum(r for _, r in stat.values())
+                pairs.append(("changes", f"{dirty} files uncommitted  +{add} -{rem}", "warn"))
+            else:
+                ahead = repo.run("rev-list", "--left-right", "--count", "@{u}...HEAD", check=False).split()
+                sync = ""
+                if len(ahead) == 2:
+                    behind, fwd = int(ahead[0]), int(ahead[1])
+                    sync = " · in sync with upstream" if not (behind or fwd) else f" · {fwd} ahead, {behind} behind upstream"
+                pairs.append(("changes", "clean" + sync, "ok"))
+        except (GitError, ValueError):
+            pass
+
+    open_issues = state.open_ledger(repo.root if repo else None)
+    if open_issues:
+        first = open_issues[-1]
+        ref = f"#{first['number']} " if first.get("number") else ""
+        more = f" (+{len(open_issues) - 1} more)" if len(open_issues) > 1 else ""
+        pairs.append(("issues", f"{len(open_issues)} open from agents · {ref}{first['title'][:48]}{more}", "warn"))
+    else:
+        fixed = sum(1 for e in state.ledger(repo.root if repo else None)
+                    if e.get("status") in ("closed", "resolved") and time.time() - e.get("resolved_at", 0) < 7 * 86400)
+        pairs.append(("issues", "none open" + (f" · {fixed} fixed by agents this week" if fixed else ""), "ok" if fixed else "muted"))
+
+    today = state.totals_today()
+    if today["runs"]:
+        pairs.append(("today", f"{_n(today['runs'], 'run')} · {_n(today['commits'], 'commit')} · "
+                               f"{_n(today['merged'], 'PR')} merged", ""))
+
+    safety = []
+    if repo and config.checkpoints:
+        from . import checkpoints
+
+        try:
+            cp = checkpoints.latest(repo)
+            safety.append(f"checkpoint {ui.ago(cp.t)} ago" if cp else "no checkpoints yet")
+        except GitError:
+            pass
+    if config.rapid_response:
+        from . import hooks
+
+        safety.append("rapid response " + ("hook on" if hooks.installed() else "via supervise"))
+    if safety:
+        pairs.append(("safety", " · ".join(safety), "muted"))
+
+    if waiting:
+        hint = f"{waiting[0].agent} needs you in {waiting[0].repo_name}; or run agents under `gitnolo supervise` to answer for you"
+    elif dirty and not any(s.repo == (repo.root if repo else None) for s in busy):
+        hint = "c ships these changes now: micro-commits, PR, merge"
+    elif busy:
+        hint = "w to watch; each finished turn is shipped as it ends"
+    elif open_issues:
+        hint = "f writes a handoff brief with the open problems for your next agent"
+    else:
+        hint = "w to start watching; gitnolo ships every agent turn the moment it ends"
+    pairs.append(("next", hint, "accent"))
+    return ui.kv_lines(pairs)
 
 
 def home(config: AppConfig) -> int:
@@ -419,19 +705,30 @@ def home(config: AppConfig) -> int:
         repo: Optional[Repo] = Repo(".")
     except GitError:
         repo = None
-    working = sum(1 for s in rows if s.state in ("working", "running"))
-    waiting = sum(1 for s in rows if s.state == "waiting")
-    lines = ui.kv_lines([
-        ("repo", f"{repo.name} on {repo.branch_display()}" if repo else "not in a repository (watching all)", "path"),
-        ("agents", f"{working} working · {waiting} waiting · {len(rows)} recent", "accent" if working else ""),
-        ("commits", f"private {config.private_commit_target} · public {config.public_commit_min}-{config.public_commit_max}"),
-        ("github", "auto PR + merge" if config.auto_pr and config.auto_merge else ("auto PR" if config.auto_pr else "local only")),
-    ])
+    lines = _home_lines(config, rows, repo, State())
+    if edition.is_community():
+        lines += ui.kv_lines([("edition", "community · public repos only", "muted")])
     ui.header(__version__, "Autonomous git for coding agents", lines)
     if rows:
         ui.console.print(agents_table(tr))
+    from . import tui
+
+    last = 0
     while True:
         ui.console.print()
+        if tui.interactive():
+            try:
+                pick = tui.menu("gitnolo", [(n, d) for _, n, d in PALETTE], last, [k for k, _, _ in PALETTE])
+            except KeyboardInterrupt:
+                return 0
+            if pick is None or PALETTE[pick][1] == "quit":
+                return 0
+            last, name = pick, PALETTE[pick][1]
+            try:
+                main([name] if name != "watch" else ["watch", "-y"], config=config)
+            except KeyboardInterrupt:
+                pass
+            continue
         for key, name, desc in PALETTE:
             ui.console.print(Text.assemble(("  " + key + "  ", "accent.bold"), (f"{name:<10}", "bold"), (desc, "muted")))
         try:
@@ -449,8 +746,9 @@ def home(config: AppConfig) -> int:
 
 # ------------------------------------------------------------------ parser
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="gitnolo", description="Autonomous git for coding agents")
-    p.add_argument("--version", action="version", version=f"gitnolo {__version__}")
+    p = argparse.ArgumentParser(prog="gitnolo" if edition.is_community() else "gitnolo-x", description="Autonomous git for coding agents")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__} ({edition.EDITION}, "
+                   f"python {sys.version_info[0]}.{sys.version_info[1]})")
     sub = p.add_subparsers(dest="command")
 
     c = sub.add_parser("commit", help="micro-commit, push, PR and merge the current changes")
@@ -482,6 +780,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--dry-run", action="store_true")
     i.add_argument("--no-ai", action="store_true")
     i.add_argument("-y", "--yes", action="store_true")
+    i.add_argument("--list", action="store_true", help="issues gitnolo is tracking (snapped, open, closed)")
+    i.add_argument("--all", action="store_true", help="with --list: include closed and resolved")
 
     pr = sub.add_parser("pr", help="list or merge pull requests")
     pr.add_argument("action", nargs="?", default="list", choices=["list", "merge"])
@@ -491,7 +791,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("supervise", help="run an agent in a PTY, auto-approving safe prompts")
     s.add_argument("-y", "--yes", action="store_true")
+    s.add_argument("--no-rapid", action="store_true", help="never answer questions for you")
     s.add_argument("agent_cmd", nargs=argparse.REMAINDER)
+
+    mp = sub.add_parser("map", help="live map: agents as cars on the road")
+    mp.add_argument("-n", "--limit", type=int, default=10)
+
+    rw = sub.add_parser("rewind", help="list checkpoints, or restore one (undo an agent's work)")
+    rw.add_argument("checkpoint", nargs="?", help="# from the list, or a checkpoint name")
+    rw.add_argument("--save", nargs="?", const="", metavar="LABEL", help="take a checkpoint now")
+    rw.add_argument("-n", "--limit", type=int, default=15)
+    rw.add_argument("-y", "--yes", action="store_true")
+    rw.add_argument("--repo")
+
+    bf = sub.add_parser("brief", help="handoff brief for the next agent session")
+    bf.add_argument("--days", type=int, default=7)
+    bf.add_argument("-o", "--out", help="write to a file")
+    bf.add_argument("-c", "--copy", action="store_true", help="copy to the clipboard")
+    bf.add_argument("--repo")
+
+    hk = sub.add_parser("hooks", help="rapid response hook for Claude Code")
+    hk.add_argument("action", nargs="?", default="status", choices=["status", "install", "uninstall"])
 
     cf = sub.add_parser("conflict", help="resolve merge conflicts")
     cf.add_argument("--repo")
@@ -507,6 +827,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="diagnostics")
     sub.add_parser("status", help="alias of doctor")
 
+    ex = sub.add_parser("explain", help="AI explains a commit, a file's history, or FILE:START-END")
+    ex.add_argument("target", nargs="?", default="HEAD")
+    sub.add_parser("ops", help="arrow-key git operations: stage, commit, push, pull, branch, merge, tag")
+    rb = sub.add_parser("rebase", help="interactive rebase: reorder, squash, reword, drop")
+    rb.add_argument("base", nargs="?", help="rebase commits after this ref (default: upstream or HEAD~10)")
     # GitLens
     b = sub.add_parser("blame", help="blame heatmap: FILE or FILE:START-END")
     b.add_argument("target")
@@ -570,12 +895,30 @@ def main(argv: Optional[List[str]] = None, config: Optional[AppConfig] = None) -
             return cmd_supervise(args, config)
         if cmd == "conflict":
             return cmd_conflict(args, config)
+        if cmd == "map":
+            return cmd_map(args, config)
+        if cmd == "rewind":
+            return cmd_rewind(args, config)
+        if cmd == "brief":
+            return cmd_brief(args, config)
+        if cmd == "hooks":
+            return cmd_hooks(args, config)
         if cmd == "config":
             return cmd_config(args, config)
         if cmd == "ai":
             return cmd_ai(args, config)
         if cmd in ("doctor", "status"):
             return cmd_doctor(args, config)
+        if cmd == "explain":
+            from . import tui
+            from .ai import make_client
+
+            return tui.explain(_repo(None), args.target, make_client(config))
+        if cmd in ("ops", "rebase"):
+            from . import tui
+
+            repo = _repo(None)
+            return tui.ops(repo) if cmd == "ops" else tui.rebase(repo, args.base)
         if cmd in LENS_COMMANDS:
             return cmd_lens(args, config)
     except KeyboardInterrupt:

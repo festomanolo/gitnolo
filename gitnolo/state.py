@@ -5,6 +5,11 @@ issue fingerprints, visibility cache, open work branches and run history.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "json", "threading", "gitnolo.config",
+]
+
 import json
 import os
 import threading
@@ -16,13 +21,14 @@ from .config import CONFIG_DIR
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 MAX_TURNS = 4000
 MAX_HISTORY = 300
+MAX_LEDGER = 400
 
 
 class State:
     def __init__(self, path: str = STATE_FILE):
         self.path = path
         self._lock = threading.RLock()
-        self.data: Dict[str, Any] = {"turns": [], "issues": {}, "visibility": {}, "branches": {}, "history": []}
+        self.data: Dict[str, Any] = {"turns": [], "issues": {}, "visibility": {}, "branches": {}, "history": [], "ledger": {}}
         self._load()
 
     def _load(self) -> None:
@@ -71,6 +77,25 @@ class State:
     def add_issue(self, repo: str, fp: str, number: int) -> None:
         with self._lock:
             self.data.setdefault("issues", {}).setdefault(repo, {})[fp] = number
+
+    # issue ledger: every agent-reported problem, from snapped to closed
+    def ledger(self, repo: Optional[str] = None) -> List[Dict[str, Any]]:
+        led = self.data.setdefault("ledger", {})
+        if repo is not None:
+            return led.setdefault(repo, [])
+        return [e for entries in led.values() for e in entries]
+
+    def ledger_add(self, repo: str, entry: Dict[str, Any]) -> Dict[str, Any]:
+        with self._lock:
+            entries = self.data.setdefault("ledger", {}).setdefault(repo, [])
+            entry.setdefault("t", time.time())
+            entry.setdefault("id", f"L{int(entry['t'] * 1000) % 10**10:010d}{len(entries)}")
+            entries.append(entry)
+            del entries[:-MAX_LEDGER]
+            return entry
+
+    def open_ledger(self, repo: Optional[str] = None) -> List[Dict[str, Any]]:
+        return [e for e in self.ledger(repo) if e.get("status") in ("snapped", "open", "local")]
 
     # open work branches (PR not merged yet)
     def open_branch(self, repo: str) -> Optional[Dict[str, Any]]:

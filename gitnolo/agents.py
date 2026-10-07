@@ -17,6 +17,11 @@ tail is parsed, so a scan costs a few stat() calls in the steady state.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "glob", "json", "re", "gitnolo.gitcore",
+]
+
 import glob
 import json
 import os
@@ -96,6 +101,10 @@ def parse_reset(text: str, now: Optional[float] = None) -> Optional[float]:
     return ts
 
 TAIL_BYTES = 768 * 1024
+MAX_MESSAGES = 40
+LOOP_REPEATS = 4        # the same tool call this many times in the last LOOP_WINDOW calls = a loop
+LOOP_WINDOW = 10
+LOOP_ERRORS = 3         # this many failed tool calls in a row = a loop
 USER_GATED_TOOLS = {"AskUserQuestion", "ExitPlanMode", "EnterPlanMode"}
 
 
@@ -118,6 +127,7 @@ class Session:
     stop_reason: str = ""
     stop_detail: str = ""
     resume_at: Optional[float] = None
+    messages: List[Tuple[str, str, float]] = field(default_factory=list)  # (id, text, ts) of recent agent messages
 
     @property
     def partial(self) -> bool:
@@ -135,7 +145,7 @@ class Session:
 
 @dataclass
 class AgentEvent:
-    kind: str  # "turn_finished" | "waiting" | "stopped" | "stalled" | "exited" | "started"
+    kind: str  # "turn_finished" | "turn_started" | "waiting" | "stopped" | "stalled" | "looping" | "exited" | "started" | ...
     session: Session
     at: float = field(default_factory=time.time)
 
@@ -334,6 +344,10 @@ class ClaudeCodeAdapter:
             else:
                 detail = "thinking"
 
+        if state == WORKING:
+            loop = self._loop(relevant)
+            if loop:
+                detail = f"loop:{loop}"
         if api_err and state == FINISHED:
             err_text, err_kind, err_uuid = api_err
             stop_reason = classify_error(err_text, err_kind)
@@ -359,7 +373,57 @@ class ClaudeCodeAdapter:
             final_message=final,
             detail=detail,
             source=path,
+            messages=self._messages(relevant),
         )
+
+    @staticmethod
+    def _messages(entries: List[Dict[str, Any]]) -> List[Tuple[str, str, float]]:
+        out: List[Tuple[str, str, float]] = []
+        for e in entries:
+            if e.get("type") != "assistant" or e.get("isApiErrorMessage"):
+                continue
+            content = (e.get("message") or {}).get("content")
+            if isinstance(content, list):
+                text = "\n".join(str(b.get("text", "")) for b in content if isinstance(b, dict) and b.get("type") == "text")
+            else:
+                text = str(content or "")
+            if text.strip():
+                out.append((str(e.get("uuid") or e.get("timestamp")), text.strip(), _parse_ts(e.get("timestamp")) or 0.0))
+        return out[-MAX_MESSAGES:]
+
+    @staticmethod
+    def _loop(entries: List[Dict[str, Any]]) -> str:
+        """Describes a loop in the current turn: repeated identical tool calls or a run of failures."""
+        calls: List[str] = []
+        names: List[str] = []
+        errors = 0
+        streak = True  # still counting the trailing run of failed tool results
+        for e in reversed(entries):
+            content = (e.get("message") or {}).get("content")
+            if e.get("type") == "user":
+                if isinstance(content, str) or not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content or []):
+                    break  # the prompt that started this turn
+                for b in reversed(content):
+                    if streak and isinstance(b, dict) and b.get("type") == "tool_result":
+                        if b.get("is_error"):
+                            errors += 1
+                        else:
+                            streak = False
+            elif e.get("type") == "assistant" and isinstance(content, list):
+                for b in content:
+                    if isinstance(b, dict) and b.get("type") == "tool_use":
+                        names.append(str(b.get("name", "")))
+                        calls.append(names[-1] + json.dumps(b.get("input"), sort_keys=True, default=str))
+            if len(calls) >= LOOP_WINDOW:
+                break
+        if errors >= LOOP_ERRORS:
+            return f"{errors} failed tool calls in a row"
+        if calls:
+            sig = max(set(calls), key=calls.count)
+            n = calls.count(sig)
+            if n >= LOOP_REPEATS:
+                return f"same {names[calls.index(sig)]} call {n}x"
+        return ""
 
     @staticmethod
     def _turn_api_error(entries: List[Dict[str, Any]]) -> Optional[Tuple[str, str, str]]:
@@ -508,7 +572,12 @@ class KiroAdapter:
                 elif t == "tool_call":
                     detail = f"tool:{p.get('name') or p.get('toolName') or ''}"
         ts = _parse_ts(relevant[-1][0].get("timestamp")) if relevant else None
+        said = [
+            (f"{e.get('id') or i}", str(q["content"]).strip(), _parse_ts(e.get("timestamp")) or 0.0)
+            for i, (e, q) in enumerate(relevant) if q.get("type") == "assistant" and str(q.get("content") or "").strip()
+        ]
         return Session(
+            messages=said[-MAX_MESSAGES:],
             stop_reason=stop_reason,
             stop_detail=stop_detail,
             key=f"kiro:{sid}",
@@ -658,7 +727,13 @@ class AntigravityAdapter:
                 text = re.sub(r"</?[A-Z_]+>", "", text).strip()
                 if text:
                     title = text.splitlines()[0][:80]
+        said = [
+            (f"{e.get('step_index')}", str(e["content"]).strip(), _parse_ts(e.get("created_at")) or 0.0)
+            for e in entries
+            if e.get("source") == "MODEL" and e.get("type") == "PLANNER_RESPONSE" and str(e.get("content") or "").strip()
+        ]
         return Session(
+            messages=said[-MAX_MESSAGES:],
             stop_reason=stop_reason,
             key=f"agy:{sid}",
             agent="agy",
@@ -778,6 +853,7 @@ class Tracker:
         self._pid_of: Dict[str, int] = {}
         self._closed: Dict[str, float] = {}
         self._reset_announced: set = set()
+        self._loop_announced: set = set()
         self._initialized = False
 
     def poll(self) -> Tuple[List[Session], List[AgentEvent]]:
@@ -855,6 +931,13 @@ class Tracker:
                     gone.updated = time.time()
                     gone.turn_id = f"exit:{old.agent}:{pid}:{int(old.started)}"
                     events.append(AgentEvent("exited", gone))
+            for key, s in current.items():
+                prev = self._prev_state.get(key)
+                if s.state in (WORKING, WAITING) and prev in (FINISHED, INTERRUPTED, IDLE, LIMITED, ERRORED, CLOSED, STALLED):
+                    events.append(AgentEvent("turn_started", s))
+                if s.detail.startswith("loop:") and (key, s.detail) not in self._loop_announced:
+                    self._loop_announced.add((key, s.detail))
+                    events.append(AgentEvent("looping", s))
             for s in current.values():
                 if s.state == LIMITED and s.resume_at and time.time() >= s.resume_at and s.turn_id not in self._reset_announced:
                     self._reset_announced.add(s.turn_id)

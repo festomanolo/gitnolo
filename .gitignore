@@ -25,3 +25,24 @@ venv/
 ENV/
 .DS_Store
 .micro_activity.log
+
+# private
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+
+# private: never published
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+AGENTS.md
+.cursor/
+.kiro/
+.mcp.json
+.env.*
+*.pem
+*.key
+.gitnolo/
+.pytest_cache/
+.idea/
+.vscode/

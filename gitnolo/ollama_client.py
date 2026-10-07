@@ -5,6 +5,11 @@ never stall the pipeline; callers always have a deterministic fallback.
 
 from __future__ import annotations
 
+# Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
+__lazy_modules__ = [
+    "json", "re", "urllib.error", "urllib.request",
+]
+
 import json
 import re
 import time
