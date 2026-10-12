@@ -44,6 +44,11 @@ DEFAULT_MONITORED_AGENTS = [
 @dataclass
 class AppConfig:
     # AI
+    onboarded: bool = False              # first-run `gitnolo setup` finished
+    auth_url: str = ""                   # sign-in server, e.g. https://your-domain.com/gitnolo/auth
+    auth_token: Optional[str] = None     # session id from Google sign-in
+    auth_email: Optional[str] = None
+    auth_last_ping: float = 0.0
     ai_provider: str = "auto"           # auto | openrouter | ollama | off
     openrouter_api_key: Optional[str] = None
     openrouter_model: Optional[str] = None  # None = best available ":free" model

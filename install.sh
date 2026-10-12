@@ -40,4 +40,5 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) say "Add this to your shell profile:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
-say "Next:  gitnolo doctor   then   gitnolo watch -y"
+[ -t 0 ] && "$BIN_DIR/gitnolo" setup
+say "Next:  gitnolo watch -y"

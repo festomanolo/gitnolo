@@ -489,6 +489,10 @@ def cmd_doctor(args: argparse.Namespace, config: AppConfig) -> int:
         who = gl.viewer() if gl.token else None
         ui.detail(f"gitlab     {gl.host}: " + ("signed in as " + who if who else "no working token (set GITLAB_TOKEN)"),
                   "ok" if who else "warn")
+    from . import auth
+
+    ui.detail(f"account    {'signed in as ' + config.auth_email if config.auth_token else ('not signed in (gitnolo login)' if auth.base_url(config) else 'sign-in not configured')}",
+              "ok" if config.auth_token else "warn")
     client = make_client(config)
     ui.detail(f"ai         {type(client).__name__.replace('Client', '') + ' · ' + str(client.model_name) if client else 'off (heuristics only)'}",
               "ok" if client else "muted")
@@ -585,6 +589,8 @@ PALETTE = [
     ("u", "rewind", "Undo an agent's work: restore a checkpoint"),
     ("f", "brief", "Handoff brief for your next agent session"),
     ("r", "conflict", "Resolve merge conflicts"),
+    ("s", "setup", "Connect AI (OpenRouter key or Ollama)"),
+    ("l", "release", "Build and publish a release"),
     ("d", "doctor", "Check GitHub/GitLab, AI and agent detection"),
     ("q", "quit", ""),
 ]
@@ -824,6 +830,13 @@ def build_parser() -> argparse.ArgumentParser:
     ai = sub.add_parser("ai", help="AI provider status")
     ai.add_argument("--test", action="store_true", help="time one real generation")
 
+    sub.add_parser("login", help="sign in with Google")
+    sub.add_parser("logout", help="sign out")
+    sub.add_parser("setup", help="connect AI (OpenRouter key from clipboard, or Ollama)")
+    rl = sub.add_parser("release", help="build and publish a GitHub release")
+    rl.add_argument("tag", nargs="?", help="tag, default: next patch")
+    rl.add_argument("--no-build", action="store_true")
+    rl.add_argument("-y", "--yes", action="store_true", help="skip the confirmations")
     sub.add_parser("doctor", help="diagnostics")
     sub.add_parser("status", help="alias of doctor")
 
@@ -879,8 +892,29 @@ def main(argv: Optional[List[str]] = None, config: Optional[AppConfig] = None) -
     config = config or AppConfig.load()
     cmd = args.command
     try:
+        if cmd not in ("login", "logout"):
+            from . import auth
+            auth.heartbeat(config)
         if cmd is None:
+            if not config.onboarded and sys.stdin.isatty():
+                from . import onboard
+                onboard.run(config)
             return home(config)
+        if cmd in ("login", "logout"):
+            from . import auth, onboard
+            if cmd == "logout":
+                auth.logout(config)
+                ui.ok("signed out")
+                return 0
+            r = onboard.Rail("gitnolo login")
+            r.end("done") if auth.step(r, config, True) else r.end("not signed in")
+            return 0
+        if cmd == "setup":
+            from . import onboard
+            return onboard.run(config, force=True)
+        if cmd == "release":
+            from . import release
+            return release.run(config, args.tag, args.no_build, args.yes)
         if cmd == "commit":
             return cmd_commit(args, config)
         if cmd == "watch":

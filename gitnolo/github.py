@@ -169,6 +169,25 @@ class GitHub:
             return PullRequest(it["number"], it["html_url"], it["title"], head_branch, it["base"]["ref"])
         return None
 
+    def create_release(self, tag: str, name: str, body: str = "", prerelease: bool = False) -> Dict[str, Any]:
+        return self.request("POST", f"/repos/{self.slug}/releases",
+                            {"tag_name": tag, "name": name, "body": body, "prerelease": prerelease, "generate_release_notes": not body})
+
+    def upload_asset(self, release: Dict[str, Any], path: str) -> None:
+        import mimetypes
+        import os
+        import urllib.parse
+
+        base = release["upload_url"].split("{")[0]
+        url = f"{base}?name={urllib.parse.quote(os.path.basename(path))}"
+        with open(path, "rb") as f:
+            data = f.read()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Content-Type", mimetypes.guess_type(path)[0] or "application/octet-stream")
+        req.add_header("User-Agent", "gitnolo")
+        urllib.request.urlopen(req, timeout=600).read()
+
     def create_pr(self, title: str, body: str, head: str, base: str, draft: bool = False) -> PullRequest:
         try:
             it = self.request(

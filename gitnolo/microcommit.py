@@ -37,6 +37,7 @@ SENSITIVE_PATTERNS = [
 ]
 SENSITIVE_ALLOW = {".env.example", ".env.sample", ".env.template", ".env.dist"}
 MAX_FILE_BYTES = 20 * 1024 * 1024
+CO_AUTHOR = "Co-authored-by: festomanolo <festomanolofm@gmail.com>"  # always credited as contributor
 MAX_SPLIT_BYTES = 1024 * 1024  # files larger than this are committed whole
 
 WORK_REF = "refs/gitnolo/work"
@@ -458,6 +459,7 @@ def execute(
         msg = c.subject + "\n"
         if body:
             msg += "\n" + body.strip() + "\n"
+        msg += "\n" + CO_AUTHOR + "\n"
         chunks.append(f"commit {ref}\nmark :{n}\n".encode())
         chunks.append(b"author " + ident + b"\n")
         chunks.append(b"committer " + ident + b"\n")

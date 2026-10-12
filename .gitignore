@@ -30,6 +30,10 @@ ENV/
 CLAUDE.md
 CLAUDE.local.md
 .claude/
+server/gitnolo-auth/config.php
+gitnolo-hostinger.zip
+gitnolo-hostinger-update.zip
+gitnolo-pages.zip
 
 # private: never published
 CLAUDE.md
