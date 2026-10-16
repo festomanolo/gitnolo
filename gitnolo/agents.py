@@ -637,8 +637,11 @@ class AntigravityAdapter:
     CWD_RE = re.compile(r'Cwd\\?"?\s*[:=]\s*\\?"?\\?"?(/[^"\\\n]+)')
 
     def __init__(self, home: Optional[str] = None):
-        base = os.path.join(home or os.path.expanduser("~"), ".gemini", "antigravity-cli")
+        gem = os.path.join(home or os.path.expanduser("~"), ".gemini")
+        base = os.path.join(gem, "antigravity-cli")
         self.root = os.path.join(base, "brain")
+        # the IDE (and its older layout) keep the same transcript format under their own brain dirs
+        self.roots = [self.root] + [os.path.join(gem, d, "brain") for d in ("antigravity-ide", "antigravity")]
         self.cache = _FileCache()
         self.cwds: Dict[str, str] = {}
         self.log = AgyLog(base)
@@ -646,8 +649,10 @@ class AntigravityAdapter:
     def scan(self, horizon: float) -> List[Session]:
         now = time.time()
         out = []
-        pattern = os.path.join(glob.escape(self.root), "*", ".system_generated", "logs", "transcript.jsonl")
-        for path in glob.glob(pattern):
+        paths: List[str] = []
+        for root in self.roots:
+            paths += glob.glob(os.path.join(glob.escape(root), "*", ".system_generated", "logs", "transcript.jsonl"))
+        for path in paths:
             try:
                 st = os.stat(path)
             except OSError:
@@ -833,6 +838,22 @@ class ProcessScanner:
         return list(found.values())
 
 
+def antigravity_ide_pid() -> Optional[int]:
+    """Main process of a running Antigravity IDE (an Electron GUI app, so ProcessScanner skips it)."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    for proc in psutil.process_iter(["pid", "exe"]):
+        try:
+            exe = proc.info.get("exe") or ""
+            if "Antigravity" in exe and exe.endswith(".app/Contents/MacOS/Electron"):
+                return proc.info["pid"]
+        except Exception:
+            continue
+    return None
+
+
 # ---------------------------------------------------------------- tracker
 class Tracker:
     """Fuses transcripts and processes into sessions and emits lifecycle events."""
@@ -882,8 +903,21 @@ class Tracker:
                 best.started = p.started
                 covered.add(p.pid)
 
+        # Antigravity IDE is a GUI app: if it is running, its newest session per repo is live.
+        ide = antigravity_ide_pid() if self.procs and any(
+            isinstance(a, AntigravityAdapter) for a in self.adapters) else None
+        if ide:
+            newest: Dict[str, Session] = {}
+            for s in transcript_sessions:
+                if s.agent == "agy" and "antigravity-ide" in s.source and not s.pid:
+                    if s.repo not in newest or s.updated > newest[s.repo].updated:
+                        newest[s.repo] = s
+            for s in newest.values():
+                s.pid = ide
+            covered.add(ide)
+
         # A transcript whose agent process vanished while it was mid-task.
-        live_pids = {p.pid for p in procs}
+        live_pids = {p.pid for p in procs} | ({ide} if ide else set())
         for s in transcript_sessions:
             prev_pid = self._pid_of.get(s.key)
             if s.pid:
@@ -956,6 +990,9 @@ class Tracker:
                  FINISHED: 6, IDLE: 7, EXITED: 8}
         rows.sort(key=lambda s: (order.get(s.state, 9), -s.updated))
         return rows
+
+    def busy_any(self) -> bool:
+        return any(s.state in (WORKING, RUNNING) for s in self.sessions.values())
 
     def busy_in_repo(self, repo: str, exclude_key: Optional[str] = None, recent: float = 120) -> List[Session]:
         now = time.time()

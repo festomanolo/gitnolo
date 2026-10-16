@@ -12,9 +12,10 @@ __lazy_modules__ = [
 
 import argparse
 import os
+import re
 import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
@@ -249,6 +250,119 @@ def cmd_pr(args: argparse.Namespace, config: AppConfig) -> int:
     return 0
 
 
+def _limit_handler(config: AppConfig, agent_cmd: List[str]) -> Optional[Callable[[str], Optional[List[str]]]]:
+    """on_limit callback for supervise: switch Chrome profile, then restart the agent with a handoff prompt."""
+    from . import failover
+
+    fam = failover.family(agent_cmd[0])
+    profiles = config.agent_profiles.get(fam) or []
+    if len(profiles) < 2:
+        return None
+
+    def handle(screen: str) -> Optional[List[str]]:
+        session = None
+        try:
+            session = latest_session(os.getcwd(), config)
+            if session and failover.family(session.agent) != fam:
+                session = None
+        except Exception:
+            pass
+        ui.notify("gitnolo", f"{fam} hit its usage limit; switching account", urgent=True)
+        res = failover.failover(fam, profiles, session, os.getcwd(), re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", screen),
+                                until=session.resume_at if session else None)
+        if not res:
+            ui.notify("gitnolo", f"{fam}: every profile is at its limit", urgent=True)
+            return None
+        profile, prompt = res
+        os.environ["BROWSER"] = failover.browser_wrapper(profile)
+        ui.notify("gitnolo", f"{fam} switched to Chrome profile '{profile}'; continuing where it stopped", urgent=True)
+        return failover.resume_cmd(fam, prompt) if config.failover_auto_resume else None
+
+    return handle
+
+
+def cmd_failover(args: argparse.Namespace, config: AppConfig) -> int:
+    from . import failover
+
+    fam = failover.family(args.agent) if args.agent else None
+    if args.profiles:
+        config.agent_profiles[fam] = args.profiles
+        config.save()
+        ui.ok(f"{fam}: {len(args.profiles)} profiles ({', '.join(args.profiles)})")
+    if args.switch:
+        profiles = config.agent_profiles.get(fam) or []
+        res = failover.failover(fam, profiles, latest_session(os.getcwd(), config) if _in_repo() else None, os.getcwd())
+        if not res:
+            ui.error(f"no profile available to switch to for {fam}")
+            return 1
+        ui.ok(f"{fam} now on Chrome profile '{res[0]}'; run `gitnolo resume {fam}` to continue the work")
+        return 0
+    if not config.agent_profiles:
+        ui.detail("no profiles yet: gitnolo failover kiro 'Default' 'Profile 1'   (Chrome profile directory names)")
+        return 0
+    limited = failover._load()
+    for agent, profs in config.agent_profiles.items():
+        cur = failover.current(agent, profs)
+        for p in profs:
+            until = limited.get(agent, {}).get("limited", {}).get(p, 0)
+            state = f"limited, back in {_fmt_secs(until - time.time())}" if until > time.time() else "ready"
+            ui.detail(f"{agent:<6} {p:<14} {'● active' if p == cur else '  ':<9} {state}")
+    return 0
+
+
+def _in_repo() -> bool:
+    try:
+        Repo(".")
+        return True
+    except GitError:
+        return False
+
+
+def _fmt_secs(n: float) -> str:
+    n = int(max(n, 0))
+    return f"{n // 3600}h{n % 3600 // 60:02d}m" if n >= 3600 else f"{n // 60}m"
+
+
+def cmd_backfill(args: argparse.Namespace, config: AppConfig) -> int:
+    """git init (if needed) and commit untracked files as micro-commits dated by file mtime."""
+    from . import autoinit
+
+    path = os.path.abspath(args.path)
+    if not os.path.isdir(os.path.join(path, ".git")):
+        if args.dry_run:
+            ui.warn(f"{path} is not a git repository; it would be initialised")
+            return 0
+        if not autoinit.init(path, config, lambda k, t: (ui.warn if k == "warn" else ui.ok)(t)):
+            ui.error(f"cannot init {path} (not a project folder?)")
+            return 1
+    n = autoinit.backfill(path, args.per_commit, lambda k, t: (ui.warn if k == "warn" else ui.ok)(t), args.dry_run)
+    if args.dry_run:
+        ui.ok(f"would create {n} dated commits")
+    elif not n:
+        ui.ok("nothing untracked to backfill")
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace, config: AppConfig) -> int:
+    """Start the agent with the saved handoff prompt for this directory."""
+    from . import failover
+    from .auto_accept import supervise_command
+
+    fam = failover.family(args.agent)
+    prompt = failover.load_handoff(os.getcwd(), fam)
+    if not prompt:
+        session = latest_session(os.getcwd(), config) if _in_repo() else None
+        prompt = failover.handoff_prompt(fam, session, os.getcwd())
+    cmd = failover.resume_cmd(fam, prompt)
+    profiles = config.agent_profiles.get(fam) or []
+    if profiles:
+        os.environ["BROWSER"] = failover.browser_wrapper(failover.current(fam, profiles))
+    ui.step(f"Resuming {fam} with a handoff prompt")
+    return supervise_command(cmd, auto_accept=True, notify=ui.notify if config.notify else None, rapid=config.rapid_response,
+                             away_seconds=config.rapid_away_seconds, choice_delay=config.rapid_choice_delay,
+                             on_limit=_limit_handler(config, cmd))
+
+
 def cmd_supervise(args: argparse.Namespace, config: AppConfig) -> int:
     from .auto_accept import supervise_command
     from .pipeline import Pipeline, RunOptions
@@ -270,7 +384,8 @@ def cmd_supervise(args: argparse.Namespace, config: AppConfig) -> int:
     except GitError:
         pass
     code = supervise_command(args.agent_cmd, auto_accept=True, notify=ui.notify if config.notify else None, rapid=rapid,
-                             away_seconds=config.rapid_away_seconds, choice_delay=config.rapid_choice_delay)
+                             away_seconds=config.rapid_away_seconds, choice_delay=config.rapid_choice_delay,
+                             on_limit=_limit_handler(config, args.agent_cmd))
     ui.detail(f"{args.agent_cmd[0]} exited with code {code}")
     try:
         repo = Repo(".")
@@ -360,6 +475,22 @@ def cmd_rewind(args: argparse.Namespace, config: AppConfig) -> int:
     ui.ok(f"rewound {n} files")
     if safety:
         ui.detail(f"undo the rewind with: gitnolo rewind {safety.short}", "faint")
+    return 0
+
+
+def cmd_achievements(args: argparse.Namespace, config: AppConfig) -> int:
+    from . import achievements
+
+    login, rows = achievements.collect()
+    if not login:
+        ui.error("No GitHub token or offline. Run `gh auth login` or set GITHUB_TOKEN.")
+        return 1
+    ui.console.print(Text.assemble(("\n  achievements  ", "accent.bold"), (f"@{login}", "muted")))
+    for name, n, hint in rows:
+        label, nxt = achievements.tier_of(name, n)
+        ui.console.print(Text.assemble(("  " + name.ljust(12), "bold"), (f"{n:<6}", "accent"), (label.ljust(9), "ok" if label != "locked" else "faint"),
+                                       (f"next at {nxt}" if nxt else "maxed", "muted")))
+        ui.console.print(Text("    " + hint, style="faint"))
     return 0
 
 
@@ -518,9 +649,9 @@ def cmd_lens(args: argparse.Namespace, config: AppConfig) -> int:
         elif c == "history":
             path, start, end = _parse_range(args.target)
             if start:
-                lens.line_history(repo, path, start, end or start)
+                lens.line_history(repo, path, start, end or start, 0 if args.all else 20, args.since)
             else:
-                lens.file_history(repo, path, args.limit)
+                lens.file_history(repo, path, 0 if args.all or args.since else args.limit, args.since)
         elif c == "graph":
             from . import tui
 
@@ -575,25 +706,59 @@ def _parse_range(target: str):
 
 
 # ------------------------------------------------------------------ home
-PALETTE = [
-    ("w", "watch", "Live dashboard; auto-commit, PR and merge when agents finish"),
-    ("c", "commit", "Micro-commit this repo now (with agent context)"),
-    ("o", "ops", "Stage, commit, push, pull, branch, merge, tag: no commands"),
-    ("e", "rebase", "Interactive rebase: reorder, squash, reword, drop"),
-    ("x", "explain", "AI explains the latest commit (or `gitnolo explain FILE`)"),
-    ("a", "agents", "Which agent is doing what, where"),
-    ("i", "insights", "Repository overview: activity, hotspots, contributors"),
-    ("g", "graph", "Commit graph"),
-    ("b", "branches", "Branches with upstream sync state"),
-    ("m", "map", "Live map: every agent as a car on its own road"),
-    ("u", "rewind", "Undo an agent's work: restore a checkpoint"),
-    ("f", "brief", "Handoff brief for your next agent session"),
-    ("r", "conflict", "Resolve merge conflicts"),
-    ("s", "setup", "Connect AI (OpenRouter key or Ollama)"),
-    ("l", "release", "Build and publish a release"),
-    ("d", "doctor", "Check GitHub/GitLab, AI and agent detection"),
-    ("q", "quit", ""),
+# (key, command, description, argument prompt or None). Key " " = no shortcut.
+GROUPS = [
+    ("Autopilot", [
+        ("w", "watch", "Live dashboard of the autopilot: commits, PRs, merges, account switches", None),
+        ("a", "agents", "Which agent is doing what, where", None),
+        ("m", "map", "Live map: every agent as a car on its own road", None),
+        ("p", "supervise", "Run an agent with auto-approve, answers when you're away, account failover", "agent command (e.g. kiro-cli chat)"),
+        ("f", "failover", "Chrome profiles to rotate through on usage limits", "agent and profiles, or empty for status (kiro Default 'Profile 1')"),
+        ("y", "resume", "Continue where the last agent stopped, with a handoff prompt", "agent (kiro | agy)"),
+    ]),
+    ("Ship", [
+        ("c", "commit", "Micro-commit this repo now (with agent context)", None),
+        ("o", "ops", "Stage, commit, push, pull, branch, merge, tag: no commands", None),
+        ("r", "pr", "List or merge pull requests", None),
+        ("i", "issues", "Open GitHub issues from the last agent report", None),
+        ("l", "release", "Build and publish a release", None),
+    ]),
+    ("History & review", [
+        ("g", "graph", "Interactive commit graph", None),
+        ("b", "branches", "Branches with upstream sync state", None),
+        ("e", "rebase", "Interactive rebase: reorder, squash, reword, drop", None),
+        ("x", "explain", "AI explains a commit, file, or FILE:A-B history", "rev, FILE or FILE:A-B (empty = latest commit)"),
+        ("h", "history", "File or line history", "FILE or FILE:START-END"),
+        ("k", "blame", "Blame heatmap", "FILE or FILE:START-END"),
+        ("d", "compare", "Compare two refs", "two refs (A B)"),
+        ("t", "search", "Search commits", "query"),
+        ("n", "insights", "Repository overview: activity, hotspots, contributors", None),
+        (" ", "show", "Commit details", "rev (empty = HEAD)"),
+        (" ", "timeline", "Commit activity sparkline", None),
+        (" ", "contributors", "Authors by commits and lines", None),
+        (" ", "hotspots", "Most frequently changed files", None),
+        (" ", "stash", "List, push, pop, apply, drop stashes", "action (list|push|pop|apply|drop|show)"),
+        (" ", "worktree", "List, add, remove worktrees", "action [path] [branch] (empty = list)"),
+    ]),
+    ("Safety", [
+        ("u", "rewind", "Undo an agent's work: restore a checkpoint", None),
+        ("j", "conflict", "Resolve merge conflicts", None),
+        ("v", "brief", "Handoff brief for your next agent session", None),
+        (" ", "hooks", "Rapid-response hook for Claude Code", "status | install | uninstall"),
+    ]),
+    ("Setup & account", [
+        ("s", "setup", "Connect AI (OpenRouter key or Ollama)", None),
+        ("?", "doctor", "Check GitHub/GitLab, AI and agent detection", None),
+        ("z", "achievements", "GitHub profile achievement progress", None),
+        (" ", "ai", "AI provider status", None),
+        (" ", "config", "Show or change settings", "show | get KEY | set KEY VALUE"),
+        (" ", "login", "Sign in with Google", None),
+        (" ", "logout", "Sign out", None),
+    ]),
 ]
+ITEMS = {name: (key, desc, ask) for _, items in GROUPS for key, name, desc, ask in items}
+PALETTE = [(k, n, d) for _, items in GROUPS for k, n, d, _ in items]  # flat view for the non-TTY launch screen
+NEEDS_ARG = {"supervise", "history", "blame", "compare", "search"}
 
 
 def _n(count: int, word: str) -> str:
@@ -703,6 +868,75 @@ def _home_lines(config: AppConfig, rows: List[Session], repo: Optional[Repo], st
     return ui.kv_lines(pairs)
 
 
+def _autopilot_line(bg: Any) -> Text:
+    if bg is None:
+        return Text("  ○ autopilot off  (autopilot=true in config, or open `watch`)", style="faint")
+    t = Text.assemble(("  ● autopilot on", "ok"), ("  commits, PRs, merges and account switches happen on their own", "muted"))
+    for ts, kind, text in bg.recent(2):
+        t.append("\n    " + time.strftime("%H:%M", time.localtime(ts)) + "  ", "faint")
+        t.append(text[:ui.console.width - 14], "muted")
+    return t
+
+
+def _start_autopilot(config: AppConfig) -> Any:
+    if not config.autopilot or not tui_interactive():
+        return None
+    from .watcher import Watcher
+
+    try:
+        return Watcher(config, auto=True, quiet=True).start_background()
+    except Exception:
+        return None
+
+
+def tui_interactive() -> bool:
+    from . import tui
+
+    return tui.interactive()
+
+
+def _run_command(name: str, config: AppConfig) -> None:
+    """Runs one menu command, asking for its argument when it needs one."""
+    from . import tui
+
+    _, _, ask = ITEMS[name]
+    argv = [name]
+    if name == "watch":
+        argv = ["watch", "-y"]
+    if ask:
+        import shlex
+
+        ui.console.print()
+        answer = tui.ask(ask)
+        try:
+            extra = shlex.split(answer)
+        except ValueError:
+            extra = answer.split()
+        if name in NEEDS_ARG and not extra:
+            ui.warn("nothing entered")
+            return
+        argv += extra
+    try:
+        main(argv, config=config)
+    except KeyboardInterrupt:
+        pass
+    except SystemExit:
+        pass  # argparse rejected the argument; its message is already shown
+    if ask or name in ("doctor", "ai", "config", "achievements", "agents", "hooks", "brief", "failover"):
+        _pause()
+
+
+def _pause() -> None:
+    from . import tui
+
+    if tui.interactive():
+        ui.console.print(Text("\n  press any key to return", style="faint"))
+        try:
+            tui.read_key()
+        except KeyboardInterrupt:
+            pass
+
+
 def home(config: AppConfig) -> int:
     tr = Tracker(config.monitored_agents, config.transcript_horizon_hours)
     tr.poll()
@@ -719,42 +953,58 @@ def home(config: AppConfig) -> int:
         ui.console.print(agents_table(tr))
     from . import tui
 
-    last = 0
-    while True:
-        ui.console.print()
-        if tui.interactive():
+    bg = _start_autopilot(config)
+    start = 0
+    names = [n for _, items in GROUPS for _, n, _, _ in items]
+    try:
+        while True:
+            ui.console.print()
+            if tui.interactive():
+                ui.console.print(_autopilot_line(bg))
+                try:
+                    name = tui.grouped_menu("gitnolo", [(c, [(k, n, d) for k, n, d, _ in items]) for c, items in GROUPS], start)
+                except KeyboardInterrupt:
+                    return 0
+                if name is None:
+                    return 0
+                start = names.index(name)
+                # one pipeline at a time: the foreground `watch` replaces the background autopilot
+                if bg is not None and name == "watch":
+                    bg.stop()
+                    bg = None
+                _run_command(name, config)
+                if bg is None and name == "watch":
+                    bg = _start_autopilot(config)
+                continue
+            for cat, items in GROUPS:
+                ui.console.print(Text(f"\n  {cat.upper()}", style="accent.bold"))
+                for key, name, desc, _ in items:
+                    ui.console.print(Text.assemble(("  " + key + "  ", "faint"), (f"{name:<13}", "bold"), (desc, "muted")))
             try:
-                pick = tui.menu("gitnolo", [(n, d) for _, n, d in PALETTE], last, [k for k, _, _ in PALETTE])
-            except KeyboardInterrupt:
+                choice = Prompt.ask(Text("\n  command >", style="accent"), default="watch", show_choices=False)
+            except (KeyboardInterrupt, EOFError):
                 return 0
-            if pick is None or PALETTE[pick][1] == "quit":
+            choice = {k: n for k, n, _ in PALETTE if k.strip()}.get(choice, choice)
+            if choice in ("q", "quit", "exit"):
                 return 0
-            last, name = pick, PALETTE[pick][1]
-            try:
-                main([name] if name != "watch" else ["watch", "-y"], config=config)
-            except KeyboardInterrupt:
-                pass
-            continue
-        for key, name, desc in PALETTE:
-            ui.console.print(Text.assemble(("  " + key + "  ", "accent.bold"), (f"{name:<10}", "bold"), (desc, "muted")))
-        try:
-            choice = Prompt.ask(Text("\n  >", style="accent"), choices=[k for k, _, _ in PALETTE], default="w", show_choices=False)
-        except (KeyboardInterrupt, EOFError):
-            return 0
-        if choice == "q":
-            return 0
-        name = next(n for k, n, _ in PALETTE if k == choice)
-        try:
-            main([name] if name != "watch" else ["watch", "-y"], config=config)
-        except KeyboardInterrupt:
-            pass
+            if choice in ITEMS:
+                _run_command(choice, config)
+            else:
+                ui.warn(f"unknown command: {choice}")
+    finally:
+        if bg is not None:
+            bg.stop()
+
+
+CREDITS = "Made by festomanolo · github.com/festomanolo · festomanolo.com"
 
 
 # ------------------------------------------------------------------ parser
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="gitnolo" if edition.is_community() else "gitnolo-x", description="Autonomous git for coding agents")
+    p = argparse.ArgumentParser(prog="gitnolo" if edition.is_community() else "gitnolo-x", description="Autonomous git for coding agents",
+                                epilog=CREDITS)
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__} ({edition.EDITION}, "
-                   f"python {sys.version_info[0]}.{sys.version_info[1]})")
+                   f"python {sys.version_info[0]}.{sys.version_info[1]})\n{CREDITS}")
     sub = p.add_subparsers(dest="command")
 
     c = sub.add_parser("commit", help="micro-commit, push, PR and merge the current changes")
@@ -800,6 +1050,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-rapid", action="store_true", help="never answer questions for you")
     s.add_argument("agent_cmd", nargs=argparse.REMAINDER)
 
+    fo = sub.add_parser("failover", help="rotate Chrome profiles when kiro/agy hit a usage limit")
+    fo.add_argument("agent", nargs="?", help="kiro | agy")
+    fo.add_argument("profiles", nargs="*", help="Chrome profile directories, in rotation order (Default, 'Profile 1', ...)")
+    fo.add_argument("--switch", action="store_true", help="switch to the next profile now")
+
+    bf = sub.add_parser("backfill", help="git init + commit old untracked files as micro-commits dated by mtime")
+    bf.add_argument("path", nargs="?", default=".")
+    bf.add_argument("-k", "--per-commit", type=int, default=3)
+    bf.add_argument("--dry-run", action="store_true")
+
+    rs = sub.add_parser("resume", help="continue where the last agent stopped, using a handoff prompt")
+    rs.add_argument("agent", nargs="?", default="kiro")
+
     mp = sub.add_parser("map", help="live map: agents as cars on the road")
     mp.add_argument("-n", "--limit", type=int, default=10)
 
@@ -809,6 +1072,8 @@ def build_parser() -> argparse.ArgumentParser:
     rw.add_argument("-n", "--limit", type=int, default=15)
     rw.add_argument("-y", "--yes", action="store_true")
     rw.add_argument("--repo")
+
+    sub.add_parser("achievements", help="GitHub profile achievement progress")
 
     bf = sub.add_parser("brief", help="handoff brief for the next agent session")
     bf.add_argument("--days", type=int, default=7)
@@ -851,6 +1116,8 @@ def build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("history", help="file history, or line history with FILE:START-END")
     h.add_argument("target")
     h.add_argument("-n", "--limit", type=int, default=30)
+    h.add_argument("-a", "--all", action="store_true", help="entire history, renames followed (years back)")
+    h.add_argument("--since", help='e.g. "5 years ago"')
     g = sub.add_parser("graph", help="commit graph")
     g.add_argument("-n", "--limit", type=int, default=40)
     g.add_argument("--current", action="store_true", help="current branch only")
@@ -890,10 +1157,12 @@ LENS_COMMANDS = {"blame", "history", "graph", "compare", "branches", "contributo
 def main(argv: Optional[List[str]] = None, config: Optional[AppConfig] = None) -> int:
     args = build_parser().parse_args(argv)
     config = config or AppConfig.load()
+    ui.set_sounds(config.notify_sound, config.notify_alert_sound)
     cmd = args.command
     try:
         if cmd not in ("login", "logout"):
-            from . import auth
+            from . import auth, usage
+            usage.bump("cmd:" + (cmd or "home"))
             auth.heartbeat(config)
         if cmd is None:
             if not config.onboarded and sys.stdin.isatty():
@@ -927,12 +1196,20 @@ def main(argv: Optional[List[str]] = None, config: Optional[AppConfig] = None) -
             return cmd_pr(args, config)
         if cmd == "supervise":
             return cmd_supervise(args, config)
+        if cmd == "failover":
+            return cmd_failover(args, config)
+        if cmd == "resume":
+            return cmd_resume(args, config)
+        if cmd == "backfill":
+            return cmd_backfill(args, config)
         if cmd == "conflict":
             return cmd_conflict(args, config)
         if cmd == "map":
             return cmd_map(args, config)
         if cmd == "rewind":
             return cmd_rewind(args, config)
+        if cmd == "achievements":
+            return cmd_achievements(args, config)
         if cmd == "brief":
             return cmd_brief(args, config)
         if cmd == "hooks":

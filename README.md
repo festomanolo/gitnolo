@@ -23,7 +23,13 @@ Community edition: works on **public GitHub and GitLab repositories** only.
 ## Install
 
 ```bash
-curl -fsSL https://festomanolo.com/gitnolo/install.sh | sh
+pip install gitnolo && gitnolo
+```
+
+Or with the installer script:
+
+```bash
+curl -fsSL https://festomanolo.com/gitnolo/install.sh | sh && gitnolo
 gitnolo doctor
 ```
 
@@ -125,6 +131,10 @@ rules when it reaches them. A local Ollama model also works:
 `gitnolo config` shows every setting, and `gitnolo config set <key> <value>` changes
 one, for example `auto_merge false` or `settle_seconds 5`.
 
+## Made by
+
+festomanolo · [github.com/festomanolo](https://github.com/festomanolo) · [festomanolo.com](https://festomanolo.com)
+
 ## Notes
 
 - Commits are written with `git fast-import`: hooks do not run and commits are not
@@ -133,3 +143,11 @@ one, for example `auto_merge false` or `settle_seconds 5`.
   as a background service.
 
 MIT License · Made by [Festo K. Magembe](https://festomanolo.com) · [festomanolo.com/gitnolo](https://festomanolo.com/gitnolo)
+
+## Uninstall
+
+```
+curl -fsSL https://festomanolo.com/gitnolo/uninstall.sh | sh
+```
+
+Add `-s -- --purge` after `sh` to also delete settings and sign-in.

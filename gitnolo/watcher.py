@@ -15,7 +15,7 @@ from __future__ import annotations
 # Deferred until first use on Python 3.15+ (PEP 810); ignored by older interpreters.
 __lazy_modules__ = [
     "queue", "threading", "rich.console", "rich.live", "rich.text", "gitnolo", "gitnolo.agents",
-    "gitnolo.config", "gitnolo.gitcore", "gitnolo.pipeline", "gitnolo.state", "gitnolo.live_issues", "gitnolo.scene",
+    "gitnolo.config", "gitnolo.gitcore", "gitnolo.pipeline", "gitnolo.state", "gitnolo.live_issues", "gitnolo.scene", "gitnolo.autoinit",
     "gitnolo.checkpoints",
 ]
 
@@ -32,7 +32,7 @@ from rich.console import Group
 from rich.live import Live
 from rich.text import Text
 
-from . import __version__, checkpoints, scene, ui
+from . import __version__, agents as agents_mod, autoinit, checkpoints, scene, ui
 from .agents import FINISHED, RUNNING, AgentEvent, Session, Tracker
 from .live_issues import LiveIssues
 from .config import AppConfig
@@ -52,13 +52,15 @@ class Pending:
 
 
 class Watcher:
-    def __init__(self, config: AppConfig, auto: bool = True, dry_run: bool = False, catch_up: bool = False, plain: bool = False):
+    def __init__(self, config: AppConfig, auto: bool = True, dry_run: bool = False, catch_up: bool = False, plain: bool = False,
+                 quiet: bool = False):
         self.config = config
         self.state = State()
         self.auto = auto
         self.dry_run = dry_run
         self.catch_up = catch_up or config.catch_up
-        self.plain = plain or not sys.stdout.isatty()
+        self.quiet = quiet  # background autopilot inside the launch screen: never touches the terminal
+        self.plain = plain or quiet or not sys.stdout.isatty()
         self.tracker = Tracker(config.monitored_agents, config.transcript_horizon_hours)
         self.pending: Dict[str, Pending] = {}
         self.log: Deque[Tuple[float, str, str]] = deque(maxlen=12)
@@ -79,9 +81,25 @@ class Watcher:
     def note(self, kind: str, text: str) -> None:
         with self._lock:
             self.log.append((time.time(), kind, text))
-        if self.plain:
+        if self.plain and not self.quiet:
             stamp = time.strftime("%H:%M:%S")
             ui.console.print(Text.assemble((stamp + "  ", "faint"), (kind.ljust(6), _KIND_STYLE.get(kind, "muted")), text))
+
+    # ------------------------------------------------------------ background
+    def start_background(self) -> "Watcher":
+        self._thread = threading.Thread(target=self.run, daemon=True, name="gitnolo-autopilot")
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = getattr(self, "_thread", None)
+        if t:
+            t.join(timeout=3)
+
+    def recent(self, n: int = 3) -> List[Tuple[float, str, str]]:
+        with self._lock:
+            return list(self.log)[-n:]
 
     # ------------------------------------------------------------ loop
     def run(self) -> None:
@@ -112,18 +130,21 @@ class Watcher:
                     while not self._stop.is_set():
                         self._tick(live)
                         live.update(self.render())
-                        time.sleep(0.25 if self.active_job else 0.8)
+                        time.sleep(0.25 if self.active_job or self.tracker.busy_any() else 0.8)
         except KeyboardInterrupt:
             pass
         finally:
             self._stop.set()
             self.state.save()
-            ui.console.print(Text("  watcher stopped", style="muted"))
+            if not self.quiet:
+                ui.console.print(Text("  watcher stopped", style="muted"))
 
     def _tick(self, live: Optional[Live] = None) -> None:
         sessions, events = self.tracker.poll()
         for ev in events:
             self._on_event(ev)
+        if self.config.auto_git_init and not self.dry_run:
+            self._auto_init(sessions)
         if self.live:
             self.live.observe(sessions)
         self._fallback_triggers(sessions)
@@ -158,6 +179,8 @@ class Watcher:
                       f"{s.agent} in {where} stopped: {why}{extra}" + (f" ({s.stop_detail[:60]})" if s.stop_detail and not extra else ""))
             if self.config.notify:
                 ui.notify("gitnolo", f"{s.agent} in {where} stopped: {why}{extra}")
+            if ev.kind == "limited":
+                self._failover(s)
             if s.repo and s.turn_id and not self.state.turn_seen(s.turn_id):
                 self.pending[s.repo] = Pending(s.repo, f"{s.agent} stopped ({why}), saving partial work", s)
         elif ev.kind == "limit_reset":
@@ -177,6 +200,26 @@ class Watcher:
             self.note("loop", f"{s.agent} in {where} looks stuck: {s.detail.split(':', 1)[-1]}")
             if self.config.notify:
                 ui.notify("gitnolo", f"{s.agent} in {where} looks stuck in a loop")
+
+    def _failover(self, s: Session) -> None:
+        """Usage limit on kiro/agy: switch to the next Chrome profile and save a handoff for `gitnolo resume`."""
+        from . import failover
+
+        fam = failover.family(s.agent)
+        profiles = self.config.agent_profiles.get(fam) or []
+        if len(profiles) < 2 or self.dry_run:
+            return
+
+        def work() -> None:
+            res = failover.failover(fam, profiles, s, s.cwd, until=s.resume_at)
+            if res:
+                self.note("start", f"{fam} switched to Chrome profile '{res[0]}'; run `gitnolo resume {fam}` in {s.repo_name}")
+                if self.config.notify:
+                    ui.notify("gitnolo", f"{fam} switched to '{res[0]}': gitnolo resume {fam} continues in {s.repo_name}", urgent=True)
+            else:
+                self.note("stop", f"{fam}: no other profile is available")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _checkpoint(self, s: Session) -> None:
         """Snapshots the repo as the agent starts working, in the background (gitnolo rewind)."""
@@ -199,13 +242,34 @@ class Watcher:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _auto_init(self, sessions: List[Session]) -> None:
+        """git init (+ dated backfill) folders an agent is working in outside git."""
+        tried = self.__dict__.setdefault("_init_tried", set())
+        for s in sessions:
+            cwd = s.cwd
+            if s.repo or not cwd or cwd in tried or time.time() - s.updated > 3600:
+                continue
+            tried.add(cwd)
+            if not autoinit.eligible(cwd):
+                continue
+
+            def work(cwd: str = cwd, s: Session = s) -> None:
+                try:
+                    if autoinit.ensure(cwd, self.config, self.note):
+                        agents_mod._root_cache.pop(cwd, None)
+                        s.repo = agents_mod.repo_for(cwd)
+                except Exception as e:
+                    self.note("warn", f"auto init {cwd}: {e}")
+
+            threading.Thread(target=work, daemon=True).start()
+
     def _sync_issues(self) -> None:
         while not self._stop.is_set():
             try:
                 self.live.sync()  # type: ignore[union-attr]
             except Exception as e:  # never let the thread die
                 self.note("warn", f"issue sync: {e}")
-            self._stop.wait(3.0)
+            self._stop.wait(self.config.issue_sync_seconds)
 
     def _fallback_triggers(self, sessions: List[Session]) -> None:
         """Process-only agents (no transcript): commit after a long quiet period."""
@@ -307,9 +371,11 @@ class Watcher:
 
             confirm = confirm_plan
         related: List[Tuple[int, str, str]] = []
+        fixed: List[Tuple[int, str, str]] = []
         if self.live and not self.dry_run:
             self.live.sync(p.repo)  # the final report's issues are due at once; file them before the PR
             related = self.live.related(p.repo, s.key if s else None)
+            fixed = self.live.fixed(p.repo)
         pipe = Pipeline(self.config, self.state, emit)
         res = pipe.run(
             p.repo,
@@ -322,6 +388,7 @@ class Watcher:
                 stop_reason=s.stop_reason if s else "",
                 issues=False if self.live else None,
                 related_issues=related,
+                fixed_issues=fixed,
                 confirm=confirm,
             ),
         )
@@ -390,11 +457,25 @@ class Watcher:
             t.add_row("", Text("no agents yet", style="muted"), "", "", "", "", "")
         with self._lock:
             entries = list(self.log)
-        log_lines = [
-            Text.assemble((time.strftime("%H:%M:%S", time.localtime(ts)) + "  ", "faint"),
-                          (_KIND_GLYPH.get(kind, "·") + " ", _KIND_STYLE.get(kind, "muted")), (text, ""))
-            for ts, kind, text in entries
-        ]
+        shown = entries[-8:]
+        busy = any(r.state in ("working", "running") for r in rows) or bool(self.active_job)
+        # "thinking" shimmer: a 3-line window slides down the log, edges faint, middle bold
+        center = int(time.time() * 2.5) % len(shown) if busy and shown else -1
+        log_lines = []
+        for i, (ts, kind, text) in enumerate(shown):
+            dist = abs(i - center) if center >= 0 else 0
+            stamp_style, body_style = ("faint", "")
+            if center >= 0:
+                if dist == 0:
+                    stamp_style, body_style = "muted", "bold"
+                elif dist == 1:
+                    stamp_style, body_style = "faint", "faint"
+                else:
+                    stamp_style, body_style = "faint", "dim"
+            log_lines.append(Text.assemble(
+                (time.strftime("%H:%M:%S", time.localtime(ts)) + "  ", stamp_style),
+                (_KIND_GLYPH.get(kind, "·") + " ", _KIND_STYLE.get(kind, "muted") if dist < 2 else "faint"),
+                (text, body_style)))
         foot = Text("  ctrl+c to stop" + ("  ·  auto: commits, pushes, opens and merges PRs" if self.auto else "  ·  confirm mode"),
                     style="faint")
         head.append_text(net)

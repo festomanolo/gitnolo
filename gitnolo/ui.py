@@ -228,14 +228,28 @@ def sparkline(values: Sequence[float]) -> str:
     return "".join(ticks[min(7, int(v / hi * 7.999))] if v else " " for v in values)
 
 
-def notify(title: str, message: str) -> None:
-    """Native macOS notification (silently ignored elsewhere)."""
+_sounds = {"normal": "Glass", "alert": "Sosumi"}
+
+
+def set_sounds(normal: str, alert: str) -> None:
+    _sounds["normal"], _sounds["alert"] = normal, alert
+
+
+def notify(title: str, message: str, urgent: Optional[bool] = None) -> None:
+    """Native macOS notification with a system sound (silently ignored elsewhere).
+
+    Urgent (default: inferred from words like approval/question/limit/stuck) uses the alert sound.
+    """
+    import re
     import subprocess
     import sys
 
     if sys.platform != "darwin":
         return
-    script = f'display notification {_osa(message)} with title {_osa(title)}'
+    if urgent is None:
+        urgent = bool(re.search(r"approv|question|waiting|limit|stopped|stuck|destructive|switched|away", message, re.I))
+    sound = _sounds["alert" if urgent else "normal"]
+    script = f'display notification {_osa(message)} with title {_osa(title)}' + (f" sound name {_osa(sound)}" if sound else "")
     try:
         subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:

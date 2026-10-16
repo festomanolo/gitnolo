@@ -26,7 +26,10 @@ STRONG_RE = re.compile(
     r"(?:is|are) (?:still )?failing|fails (?:when|on|with|to|if)|keeps? failing|"
     r"returns? (?:a |an |the )?(?:404|500|5\d\d|error|wrong|blank|empty|your main)|"
     r"second problem|another (?:problem|issue|bug)|bug remains|regression|security (?:risk|issue|hole)|"
-    r"vulnerab\w*|insecure|memory leak|race condition|deprecated|stubbed|hard-?coded (?:key|secret|token|password))\b",
+    r"vulnerab\w*|insecure|memory leak|race condition|deprecated|stubbed|hard-?coded (?:key|secret|token|password)|"
+    r"traceback|uncaught|unhandled (?:exception|rejection|error)|(?:type|reference|syntax|attribute|key|import|module|value)error|"
+    r"cannot find module|module not found|segmentation fault|out of memory|deadlock|infinite loop|"
+    r"(?:is|are)n'?t working|not working|doesn'?t work|does not work|found (?:a|an|another) (?:bug|issue|problem))\b",
     re.I,
 )
 WEAK_RE = re.compile(
@@ -274,14 +277,25 @@ def referenced_numbers(line: str) -> List[int]:
     return [int(n) for n in ISSUE_REF_RE.findall(line or "")]
 
 
-def resolves(line: str, issue_title: str, issue_source: str = "") -> bool:
-    """True when a resolution line is about the same topic as an open issue."""
+TESTS_PASS_RE = re.compile(r"\b(?:all (?:\d+ )?tests? (?:now )?pass\w*|tests? (?:now )?pass\w*|test suite (?:is )?green|build (?:now )?(?:passes|succeeds))\b", re.I)
+TEST_FAIL_RE = re.compile(r"\b(?:tests?|build|ci|suite)\b.*\bfail\w*|\bfail\w*.*\b(?:tests?|build|ci)\b", re.I)
+
+
+def resolves(line: str, issue_title: str, issue_source: str = "", same_session: bool = False) -> bool:
+    """
+    True when a resolution line is about the same topic as an open issue. The agent
+    that reported a problem gets a looser match (one shared topic word), and its
+    "all tests pass" closes the failing-test issues it reported itself.
+    """
+    if same_session and TESTS_PASS_RE.search(line) and TEST_FAIL_RE.search(issue_title + " " + issue_source):
+        return True
     a = keywords(line)
     b = keywords(issue_title) | keywords(issue_source)
     if not a or not b:
         return False
     shared = a & b
-    return len(shared) >= 2 and len(shared) / min(len(a), len(b)) >= 0.5
+    need = 1 if same_session else 2
+    return len(shared) >= need and len(shared) / min(len(a), len(b)) >= 0.5
 
 
 def draft_for(line: str, repo_name: str = "", agent: str = "", session_title: str = "", live: bool = False) -> IssueDraft:

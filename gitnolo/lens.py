@@ -29,7 +29,7 @@ REC = "\x1e"
 
 def _commits(repo: Repo, *args: str, limit: int = 50) -> List[Dict[str, str]]:
     fmt = SEP.join(["%h", "%H", "%an", "%ae", "%at", "%s", "%D"]) + REC
-    out = repo.run("log", f"--format={fmt}", f"-n{limit}", *args, check=False)
+    out = repo.run("log", f"--format={fmt}", *([f"-n{limit}"] if limit > 0 else []), *args, check=False)
     rows = []
     for rec in out.split(REC):
         rec = rec.strip("\n")
@@ -104,14 +104,16 @@ def blame(repo: Repo, path: str, start: Optional[int] = None, end: Optional[int]
 
 
 # ------------------------------------------------------------------ history
-def file_history(repo: Repo, path: str, limit: int = 30) -> None:
-    rows = _commits(repo, "--follow", "--", path, limit=limit)
-    ui.step(f"History of {path}  ({len(rows)} commits)")
+def file_history(repo: Repo, path: str, limit: int = 30, since: Optional[str] = None) -> None:
+    """limit 0 = every commit since the file was born, across renames."""
+    rows = _commits(repo, *([f"--since={since}"] if since else []), "--follow", "--", path, limit=limit)
+    first = ui.ago(float(rows[-1]["time"])) if rows else ""
+    ui.step(f"History of {path}  ({len(rows)} commits" + (f", oldest {first}" if first else "") + ")")
     ui.console.print(_commit_table(rows))
 
 
-def line_history(repo: Repo, path: str, start: int, end: int, limit: int = 20) -> None:
-    out = repo.run("log", f"-n{limit}", "--format=%x1e%h%x1f%an%x1f%at%x1f%s", "-L", f"{start},{end}:{path}", check=False)
+def line_history(repo: Repo, path: str, start: int, end: int, limit: int = 20, since: Optional[str] = None) -> None:
+    out = repo.run("log", *([f"-n{limit}"] if limit > 0 else []), *([f"--since={since}"] if since else []), "--format=%x1e%h%x1f%an%x1f%at%x1f%s", "-L", f"{start},{end}:{path}", check=False)
     ui.step(f"Line history {path}:{start}-{end}")
     for block in out.split("\x1e"):
         if not block.strip():

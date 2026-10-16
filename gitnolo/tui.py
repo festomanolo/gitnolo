@@ -68,10 +68,11 @@ class Screen:
     def __init__(self, title: str, n: Callable[[], int], row: Callable[[int, bool], Text], hint: str,
                  detail: Optional[Callable[[int], object]] = None, start: int = 0):
         self.title, self.n, self.row, self.hint, self.detail, self.cur = title, n, row, hint, detail, start
+        self.reserve = 0  # extra lines rows use beyond one each (category headers)
 
     def view(self):
         n = self.n()
-        height = max(5, ui.console.size.height - (14 if self.detail else 8))
+        height = max(5, ui.console.size.height - (14 if self.detail else 8) - self.reserve)
         top, end = _window(n, self.cur, height)
         body = Text()
         for i in range(top, end):
@@ -139,6 +140,38 @@ def menu(title: str, items: Sequence[Tuple[str, str]], start: int = 0, keys: Seq
 
     r = Screen(title, lambda: len(items), row, "↑↓ move  ⏎ select  esc back", start=start).run(on_key)
     return None if r == -1 else r
+
+
+def grouped_menu(title: str, groups: Sequence[Tuple[str, Sequence[Tuple[str, str, str]]]], start: int = 0) -> Optional[str]:
+    """Arrow-key menu with category headers. Items are (key, name, description); returns the chosen name or None."""
+    flat = [(cat, it) for cat, items in groups for it in items]
+    keys = [it[0] for _, it in flat]
+    width = max(len(it[1]) for _, it in flat) + 2
+
+    def row(i: int, sel: bool) -> Text:
+        cat, (key, name, desc) = flat[i]
+        t = Text()
+        if i == 0 or flat[i - 1][0] != cat:
+            t.append(("" if i == 0 else "\n") + f"  {cat.upper()}\n", "accent.bold")
+        t.append_text(_pointer(sel))
+        t.append(f"{key} " if key.strip() else "  ", "faint")
+        t.append(f"{name:<{width}}", "reverse bold" if sel else "bold")
+        t.append(f" {desc}", "path" if sel else "muted")
+        return t
+
+    def on_key(k: str, s: Screen):
+        if k in ("enter", "right"):
+            return s.cur
+        if k in ("esc", "q", "left"):
+            return -1
+        if k in keys:
+            return keys.index(k)
+        return None
+
+    screen = Screen(title, lambda: len(flat), row, "↑↓ move  ⏎ open  letter jump  esc quit", start=start)
+    screen.reserve = 2 * len(groups)
+    r = screen.run(on_key)
+    return None if r == -1 else flat[r][1][1]
 
 
 def multiselect(title: str, items: Sequence[Tuple[str, str]], chosen: Sequence[bool]) -> Optional[List[bool]]:

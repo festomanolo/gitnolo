@@ -74,18 +74,25 @@ def supervise_command(
     rapid: bool = True,
     away_seconds: float = 45.0,
     choice_delay: float = 15.0,
+    on_limit: Optional[Callable[[str], Optional[List[str]]]] = None,
 ) -> int:
+    """on_limit(screen_tail) -> new argv when the agent hits a usage limit (after switching account), else None."""
     if not cmd_args:
         return 1
     stdin_fd = sys.stdin.fileno()
     is_tty = os.isatty(stdin_fd)
-    pid, master = pty.fork()
-    if pid == 0:
-        try:
-            os.execvp(cmd_args[0], cmd_args)
-        except Exception as e:
-            sys.stderr.write(f"gitnolo: cannot run {cmd_args[0]}: {e}\n")
-            os._exit(127)
+
+    def spawn(argv: List[str]) -> Tuple[int, int]:
+        child, fd = pty.fork()
+        if child == 0:
+            try:
+                os.execvp(argv[0], argv)
+            except Exception as e:
+                sys.stderr.write(f"gitnolo: cannot run {argv[0]}: {e}\n")
+                os._exit(127)
+        return child, fd
+
+    pid, master = spawn(cmd_args)
 
     def sync_size(*_a) -> None:
         if is_tty:
@@ -109,6 +116,9 @@ def supervise_command(
     choice_since: Optional[float] = None
     out_fd = sys.stdout.fileno()
 
+    last_output = time.time()
+    last_failover = 0.0
+    failovers = 0
     shown = [""]
 
     def title(text: str) -> None:
@@ -130,7 +140,8 @@ def supervise_command(
                 if not data:
                     break
                 os.write(sys.stdout.fileno(), data)
-                if auto_accept:
+                last_output = time.time()
+                if auto_accept or on_limit:
                     screen = (screen + ANSI_RE.sub("", data.decode("utf-8", "ignore")))[-4000:]
             if is_tty and stdin_fd in r:
                 try:
@@ -145,6 +156,26 @@ def supervise_command(
                 if choice_since is not None:
                     choice_since = None
                     title(cmd_args[0])
+            if on_limit and screen and time.time() - last_output > 2.5 and time.time() - last_failover > 30:
+                from .failover import screen_limited
+
+                if screen_limited(screen):
+                    last_failover = time.time()
+                    new_cmd = on_limit(screen)
+                    if new_cmd:
+                        failovers += 1
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                            os.waitpid(pid, 0)
+                        except OSError:
+                            pass
+                        os.close(master)
+                        pid, master = spawn(new_cmd)
+                        cmd_args = new_cmd
+                        sync_size()
+                        screen = ""
+                        last_output = time.time()
+                        continue
             if auto_accept and screen and time.time() - last_answer > 1.5:
                 kind, answer = classify(screen)
                 now = time.time()
@@ -192,6 +223,8 @@ def supervise_command(
         except OSError:
             pass
     _, status = os.waitpid(pid, 0)
+    if failovers:
+        sys.stdout.write(f"\n[gitnolo] switched account {failovers} time(s) after usage limits\n")
     if approvals or answered_questions:
         sys.stdout.write(f"\n[gitnolo] auto-approved {approvals} prompt(s)"
                          + (f", answered {answered_questions} question(s) while you were away" if answered_questions else "") + "\n")

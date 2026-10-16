@@ -62,6 +62,7 @@ class RunOptions:
     partial: bool = False          # the agent stopped before finishing: PR as draft, never auto-merge
     stop_reason: str = ""
     related_issues: List[Tuple[int, str, str]] = field(default_factory=list)  # already filed (live issues)
+    fixed_issues: List[Tuple[int, str, str]] = field(default_factory=list)    # resolved by the agent this turn
     confirm: Optional[Callable[["mc.Plan", Dict[str, Any]], bool]] = None
 
 
@@ -175,6 +176,12 @@ class Pipeline:
             finally:
                 result.elapsed = time.time() - started
                 if result.commits and not opts.dry_run:
+                    from . import usage
+                    for k, v in (("runs", 1), ("commits", result.commits), ("pushes", int(result.pushed)), ("prs", int(bool(result.pr_url))),
+                                 ("merges", int(result.merged)), ("issues", len(result.issues)), ("files", result.files),
+                                 ("lines_added", result.added), ("lines_removed", result.removed)):
+                        usage.bump(k, v)
+                    opts.agent and usage.bump("agent:" + opts.agent[:30])
                     self.state.record(
                         {
                             "repo": repo.root,
@@ -549,6 +556,8 @@ class Pipeline:
         if len(plan.files) > 40:
             lines.append(f"- and {len(plan.files) - 40} more")
         lines += ["", f"**{len(res.subjects)} commits**, +{stats[0]} -{stats[1]}", ""]
+        if opts.fixed_issues:  # "Fixes #n" closes them on merge, even if the live close failed
+            lines += ["## Fixed issues", ""] + [f"- Fixes #{n} {t}" for n, _, t in opts.fixed_issues] + [""]
         if result.issues:
             lines += ["## Related issues", ""] + [f"- #{n} {t}" for n, _, t in result.issues] + [""]
         if is_private and opts.final_message:

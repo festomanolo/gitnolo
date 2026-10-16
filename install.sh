@@ -1,8 +1,10 @@
 #!/bin/sh
 # gitnolo community installer
 #   curl -fsSL https://festomanolo.com/gitnolo/install.sh | sh
+# Install and launch:
+#   curl -fsSL https://festomanolo.com/gitnolo/install.sh | sh && gitnolo
 # Uninstall:
-#   rm -rf ~/.gitnolo/app ~/.local/bin/gitnolo
+#   curl -fsSL https://festomanolo.com/gitnolo/uninstall.sh | sh
 set -eu
 
 REPO="${GITNOLO_REPO:-https://github.com/festomanolo/gitnolo}"
@@ -40,5 +42,4 @@ case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) say "Add this to your shell profile:  export PATH=\"$BIN_DIR:\$PATH\"" ;;
 esac
-[ -t 0 ] && "$BIN_DIR/gitnolo" setup
-say "Next:  gitnolo watch -y"
+say "Next:  gitnolo   (first run connects sign-in and AI)"

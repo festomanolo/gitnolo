@@ -39,6 +39,7 @@ Note = Callable[[str, str], None]
 OPEN = ("snapped", "open", "local")
 GH_TTL = 600.0
 MAX_ATTEMPTS = 5
+RECONCILE_EVERY = 60.0  # pick up issues closed on the forge (by hand, or by a merged "Fixes #n")
 SESSION_WINDOW = 600.0  # at most max_issues_per_turn snaps per session in this window
 
 
@@ -50,6 +51,7 @@ class LiveIssues:
         self.catch_up = catch_up
         self.seen: Dict[str, Set[str]] = {}
         self._gh: Dict[str, Tuple[float, Optional[GitHub]]] = {}
+        self._reconciled: Dict[str, float] = {}
         self._lock = state._lock  # the ledger lives in state; share its lock so saves never see a half-edit
 
     # ------------------------------------------------------------ reading
@@ -81,7 +83,8 @@ class LiveIssues:
                 for line in issue_mod.resolution_lines(text):
                     nums = issue_mod.referenced_numbers(line)
                     for e in self.state.open_ledger(repo):
-                        if (e.get("number") and e["number"] in nums) or issue_mod.resolves(line, e["title"], e.get("source", "")):
+                        if (e.get("number") and e["number"] in nums) or issue_mod.resolves(
+                                line, e["title"], e.get("source", ""), same_session=e.get("session") == s.key):
                             self._resolve(repo, e, line, s)
                             changed += 1
             turn_over = s.state in (FINISHED, INTERRUPTED, LIMITED, ERRORED, CLOSED)
@@ -191,6 +194,7 @@ class LiveIssues:
                         e.update(status="closed", closed_at=time.time())
                     self.note("ok", f"{name}: closed #{e['number']} {e['title'][:60]}")
                     done += 1
+        done += self._reconcile(now, only_repo)
         if done:
             try:
                 self.state.save()
@@ -198,7 +202,40 @@ class LiveIssues:
                 pass
         return done
 
+    def _reconcile(self, now: float, only_repo: Optional[str] = None) -> int:
+        """Marks ledger issues closed when they were closed on the forge."""
+        done = 0
+        with self._lock:
+            work = {repo: [e for e in entries if e.get("status") == "open" and e.get("number")
+                           and now - e.get("published_at", 0) > RECONCILE_EVERY]
+                    for repo, entries in self.state.data.get("ledger", {}).items()
+                    if only_repo is None or repo == only_repo}
+        for repo, entries in work.items():
+            if not entries or now - self._reconciled.get(repo, 0) < RECONCILE_EVERY:
+                continue
+            self._reconciled[repo] = now
+            gh = self.github(repo) if self.config.auto_issues else None
+            if not gh:
+                continue
+            try:
+                closed = {int(i["number"]) for i in gh.list_issues("closed", 100) if i.get("state", "closed") == "closed"}
+            except (GitHubError, KeyError, ValueError):
+                continue
+            with self._lock:
+                for e in entries:
+                    if int(e["number"]) in closed and e.get("status") == "open":
+                        e.update(status="closed", closed_at=now)
+                        done += 1
+        return done
+
     def related(self, repo: str, session_key: Optional[str] = None) -> List[Tuple[int, str, str]]:
         """Published open issues for a repo (optionally one session), for the PR body."""
         return [(int(e["number"]), e.get("url", ""), e["title"]) for e in self.state.ledger(repo)
                 if e.get("status") == "open" and e.get("number") and (not session_key or e.get("session") == session_key)]
+
+    def fixed(self, repo: str, window: float = 2 * 3600) -> List[Tuple[int, str, str]]:
+        """Published issues the agent resolved recently, for "Fixes #n" in the PR body."""
+        now = time.time()
+        return [(int(e["number"]), e.get("url", ""), e["title"]) for e in self.state.ledger(repo)
+                if e.get("number") and e.get("status") in ("closing", "closed") and e.get("resolved_by")
+                and now - e.get("resolved_at", 0) < window]

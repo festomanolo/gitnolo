@@ -63,8 +63,11 @@ def heartbeat(config: AppConfig) -> None:
     if not (config.auth_token and base_url(config)) or time.time() - config.auth_last_ping < 6 * 3600:
         return
     def go() -> None:
-        code, _ = _call(base_url(config) + "/session.php?a=ping", config.auth_token, _client_info(), timeout=5)
+        from . import usage
+        pending = usage.peek()
+        code, _ = _call(base_url(config) + "/session.php?a=ping", config.auth_token, {**_client_info(), "usage": pending}, timeout=5)
         if code == 200:
+            usage.subtract(pending)
             config.auth_last_ping = time.time()
             config.save()
         elif code == 401:  # revoked or banned

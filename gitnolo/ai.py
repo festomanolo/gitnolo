@@ -186,6 +186,8 @@ class OpenRouterClient(OllamaClient):
         if json_mode:
             body["response_format"] = {"type": "json_object"}
         self.guard.record()
+        from . import usage
+        usage.bump("ai_calls")
         try:
             data = self._request("/chat/completions", body, timeout=timeout)
         except urllib.error.HTTPError as e:

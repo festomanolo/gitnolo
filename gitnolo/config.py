@@ -69,6 +69,10 @@ class AppConfig:
     transcript_horizon_hours: float = 6.0
     catch_up: bool = False               # on start, also process turns that finished before gitnolo ran
 
+    # Account failover: Chrome profiles (one signed-in account each) to rotate through on a usage limit
+    agent_profiles: Dict[str, List[str]] = field(default_factory=dict)  # {"kiro": ["Default", "Profile 1"], "agy": [...]}
+    failover_auto_resume: bool = True    # under `gitnolo supervise`, restart the agent with a handoff prompt after switching
+
     # Commits
     private_commit_min: int = 100        # private repos: a fresh random count in [min, target] per change
     private_commit_target: int = 600     # upper bound for private repos
@@ -83,14 +87,21 @@ class AppConfig:
     merge_method: str = "merge"          # merge keeps every micro-commit in history
     delete_branch_after_merge: bool = True
     auto_issues: bool = True
-    max_issues_per_turn: int = 5
+    max_issues_per_turn: int = 12
     github_token: Optional[str] = None
     gitlab_token: Optional[str] = None
 
     # Live issues: snapped from agent messages as they stream, closed when the agent resolves them
     live_issues: bool = True
-    live_issue_grace_seconds: float = 30.0   # resolved within this window -> never published
+    live_issue_grace_seconds: float = 12.0   # resolved within this window -> never published
     auto_close_issues: bool = True
+    issue_sync_seconds: float = 1.5          # publish/close cadence (rapid response)
+
+    # Auto git init: agent folders outside git get `git init`, a same-named GitHub remote, dated backfill
+    auto_git_init: bool = True
+    auto_init_link_remote: bool = True
+    auto_backfill: bool = True
+    backfill_files_per_commit: int = 3
 
     # Rapid response (gitnolo supervise / Claude Code hook)
     rapid_response: bool = True
@@ -107,7 +118,10 @@ class AppConfig:
     # Experience
     show_map: bool = True                # animated lanes and pipeline map in `watch`
     interactive: bool = True
+    autopilot: bool = True               # launching gitnolo starts the autonomous watcher (commit, PR, merge, failover) in the background
     notify: bool = True
+    notify_sound: str = "Glass"          # macOS system sound for notifications; empty = silent
+    notify_alert_sound: str = "Sosumi"   # for things that need you: approvals, questions, limits, danger
     animations_enabled: bool = True
     max_diff_chars: int = 12000
 
